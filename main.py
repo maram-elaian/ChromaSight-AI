@@ -68,7 +68,7 @@ def get_confusion_mask(original, simulated, threshold=25):
 
 
 # ----------------------------
-# 3. Run on Image
+# 3. Run on Image & Process Pipeline
 # ----------------------------
 img = cv2.imread("test.jpg")
 
@@ -79,17 +79,29 @@ if img is None:
 sim = simulate_deuteranopia(img)
 mask = get_confusion_mask(img, sim)
 
-# ----------------------------
-# 4. Display Results
-# ----------------------------
-scale = 0.5
+# التعديل الجوهري: تحويل القناع إلى 3 قنوات ليطابق أبعاد الصور الأخرى قبل الدمج
+mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
-img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
-sim = cv2.resize(sim, (0, 0), fx=scale, fy=scale)
-mask = cv2.resize(mask, (0, 0), fx=scale, fy=scale)
-cv2.imshow("Original", img)
-cv2.imshow("Simulated Deuteranopia", sim)
-cv2.imshow("Confusion Mask", mask)
+# إضافة نصوص توضيحية مباشرة فوق الصور لتمييزها في العرض
+font = cv2.FONT_HERSHEY_SIMPLEX
+cv2.putText(img, '1. Original Feed', (20, 40), font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+cv2.putText(sim, '2. Simulated Deuteranopia', (20, 40), font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+cv2.putText(mask_3ch, '3. Extracted Confusion Mask', (20, 40), font, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
 
+# ----------------------------
+# 4. Horizontal Concatenation & Scaling
+# ----------------------------
+# دمج الصور الثلاث أفقياً في نافذة واحدة
+combined_canvas = np.hstack((img, sim, mask_3ch))
+
+# تغيير حجم اللوحة المدمجة لتناسب الشاشة أثناء العرض
+scale = 0.45
+width = int(combined_canvas.shape[1] * scale)
+height = int(combined_canvas.shape[0] * scale)
+scaled_presentation = cv2.resize(combined_canvas, (width, height), interpolation=cv2.INTER_AREA)
+
+# عرض النتيجة النهائية الموحدة
+cv2.namedWindow("ChromaSight AI - Diagnostic Dashboard", cv2.WINDOW_AUTOSIZE)
+cv2.imshow("ChromaSight AI - Diagnostic Dashboard", scaled_presentation)
 cv2.waitKey(0)
 cv2.destroyAllWindows()
