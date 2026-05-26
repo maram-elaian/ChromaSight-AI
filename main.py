@@ -1,61 +1,36 @@
-#Deuteranopia Simulation
 import cv2
 import numpy as np
+import gradio as gr
 
-# Deuteranopia matrix (Machado model)
+# -------------------------------------------------------------------------
+# MODULE 2 CORE: Computer Vision Algorithms (Your Existing Logic)
+# -------------------------------------------------------------------------
 M = np.array([
     [0.430, 0.720, -0.150],
-    [0.340, 0.620,  0.040],
-    [-0.020, 0.030,  0.990]
+    [0.340, 0.620, 0.040],
+    [-0.020, 0.030, 0.990]
 ], dtype=np.float32)
 
+
 def simulate_deuteranopia(frame):
-    # convert BGR → RGB
     img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-
-    # apply transformation
     out = cv2.transform(img, M)
-
-    # clip values
     out = np.clip(out, 0, 1)
-
-    # back to 8-bit
     out = (out * 255).astype(np.uint8)
+    # Gradio handles standard RGB arrays internally
+    return out
 
-    # RGB → BGR
-    return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
-
-# LIVE CAMERA TEST
-cap = cv2.VideoCapture(0)
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-
-    simulated = simulate_deuteranopia(frame)
-
-    cv2.imshow("Original", frame)
-    cv2.imshow("Deuteranopia Simulation", simulated)
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-# ----------------------------
-# 2. Confusion Mask
-# ----------------------------
 def get_confusion_mask(original, simulated, threshold=25):
-    orig_lab = cv2.cvtColor(original, cv2.COLOR_BGR2LAB)
-    sim_lab = cv2.cvtColor(simulated, cv2.COLOR_BGR2LAB)
+    # original and simulated are already RGB arrays from Gradio processing
+    orig_lab = cv2.cvtColor(original, cv2.COLOR_RGB2LAB)
+    sim_lab = cv2.cvtColor(simulated, cv2.COLOR_RGB2LAB)
 
-    # chromatic channels only
     orig_a, orig_b = orig_lab[:, :, 1], orig_lab[:, :, 2]
     sim_a, sim_b = sim_lab[:, :, 1], sim_lab[:, :, 2]
 
     diff_a = cv2.absdiff(orig_a, sim_a)
     diff_b = cv2.absdiff(orig_b, sim_b)
-
     diff = cv2.addWeighted(diff_a, 0.5, diff_b, 0.5, 0)
 
     _, mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
@@ -64,44 +39,98 @@ def get_confusion_mask(original, simulated, threshold=25):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.dilate(mask, kernel, iterations=1)
 
-    return mask
+    # Return as 3-channel grayscale for beautiful rendering in UI
+    return cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB)
 
 
-# ----------------------------
-# 3. Run on Image & Process Pipeline
-# ----------------------------
-img = cv2.imread("test.jpg")
+# -------------------------------------------------------------------------
+# INTERMEDIARY PIPELINE FUNCTION
+# -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# INTERMEDIARY PIPELINE FUNCTION (تعديل نظام ألوان الكاميرا الحية)
+# -------------------------------------------------------------------------
+def process_live_stream(frame, threshold_slider):
+    if frame is None:
+        return None, None, None
 
-if img is None:
-    print("Image not found!")
-    exit()
+    # السطر الجديد والمهم لإصلاح اللون الأزرق:
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-sim = simulate_deuteranopia(img)
-mask = get_confusion_mask(img, sim)
+    # 1. Generate the simulation
+    simulated_frame = simulate_deuteranopia(frame)
 
-# التعديل الجوهري: تحويل القناع إلى 3 قنوات ليطابق أبعاد الصور الأخرى قبل الدمج
-mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    # 2. Extract the confusion mask using the dynamic threshold slider value
+    confusion_mask = get_confusion_mask(frame, simulated_frame, threshold=threshold_slider)
 
-# إضافة نصوص توضيحية مباشرة فوق الصور لتمييزها في العرض
-font = cv2.FONT_HERSHEY_SIMPLEX
-cv2.putText(img, '1. Original Feed', (20, 40), font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-cv2.putText(sim, '2. Simulated Deuteranopia', (20, 40), font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-cv2.putText(mask_3ch, '3. Extracted Confusion Mask', (20, 40), font, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+    # Return all three states to update their respective UI columns simultaneously
+    return frame, simulated_frame, confusion_mask
 
-# ----------------------------
-# 4. Horizontal Concatenation & Scaling
-# ----------------------------
-# دمج الصور الثلاث أفقياً في نافذة واحدة
-combined_canvas = np.hstack((img, sim, mask_3ch))
 
-# تغيير حجم اللوحة المدمجة لتناسب الشاشة أثناء العرض
-scale = 0.45
-width = int(combined_canvas.shape[1] * scale)
-height = int(combined_canvas.shape[0] * scale)
-scaled_presentation = cv2.resize(combined_canvas, (width, height), interpolation=cv2.INTER_AREA)
+# -------------------------------------------------------------------------
+# MODULE 1: Gradio UI Layout Dashboard
+# -------------------------------------------------------------------------
+with gr.Blocks( title="ChromaSight AI - Dashboard") as demo:
+    # Header Section
+    gr.Markdown(
+        """
+        # 👁️ ChromaSight AI — Diagnostic Visualization Dashboard
+        ### Accessibility & Human-Centered AI Core Prototype
+        """
+    )
 
-# عرض النتيجة النهائية الموحدة
-cv2.namedWindow("ChromaSight AI - Diagnostic Dashboard", cv2.WINDOW_AUTOSIZE)
-cv2.imshow("ChromaSight AI - Diagnostic Dashboard", scaled_presentation)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+    # Split Layout: Left Panel for Controls, Right Panel for Diagnostic Stream
+    with gr.Row():
+        # Interactive Control Sidebar
+        with gr.Column(scale=1):
+            gr.Markdown("### 🛠️ System Configurations")
+
+            # Simulated Webcam input (Invisible stream orchestrator)
+            webcam_input = gr.Image(
+                sources=["webcam"],
+                type="numpy",
+                streaming=True,
+                label="Active Video Buffer",
+                show_label=True
+            )
+
+            # Interactive CVD selection dropdown
+            cvd_type = gr.Dropdown(
+                choices=["Deuteranopia (Green-Blind)"],
+                value="Deuteranopia (Green-Blind)",
+                label="CVD Classification Profile"
+            )
+
+            # Fine-tuning slider for the math threshold parameter
+            threshold_slider = gr.Slider(
+                minimum=5,
+                maximum=60,
+                value=25,
+                step=1,
+                label="Delta-E Sensitivity Threshold"
+            )
+
+            gr.Markdown(
+                """> **Presentation Tip:** Use a lower threshold value in low-light environments to mitigate sensor noise in the confusion matrix calculations."""
+            )
+
+        # Unified 3-Pane Diagnostic Output Grid
+        with gr.Column(scale=3):
+            gr.Markdown("### 📊 Real-Time Pipeline Displays")
+
+            with gr.Row():
+                out_orig = gr.Image(label="1. Original Live Stream", interactive=False)
+                out_sim = gr.Image(label="2. Perceptual CVD Simulation", interactive=False)
+                out_mask = gr.Image(label="3. Extracted Confusion Mask", interactive=False)
+
+    # Establish the live execution stream loop
+    # As the webcam yields frames, this event handler executes instantly and populates the output grid
+    webcam_input.stream(
+        fn=process_live_stream,
+        inputs=[webcam_input, threshold_slider],
+        outputs=[out_orig, out_sim, out_mask],
+        queue=True
+    )
+
+# Launch the interactive local development server
+if __name__ == "__main__":
+    demo.launch(theme=gr.themes.Soft(),share=False)
