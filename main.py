@@ -16,7 +16,7 @@ cached_final_composited = None
 cached_simulated_frame = None
 cached_confusion_mask = None
 
-prev_low_res_hist = None
+ema_low_res_mask = None
 accumulated_mask = None
 last_api_call_time = 0
 api_lock = threading.Lock()
@@ -119,12 +119,86 @@ def generate_local_clean_texture(style, h, w, scale_factor, angle_deg, is_live):
                                          borderMode=cv2.BORDER_REFLECT_101)
     return transformed_texture
 
+def apply_adaptive_clahe(frame):
 
+    if frame.dtype != np.uint8:
+        frame = frame.astype(np.uint8)
+
+    lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB)
+
+    l, a, b = cv2.split(lab)
+
+    brightness_std = np.std(l)
+
+    adaptive_clip = float(np.clip(
+        2.0 + (brightness_std / 45.0),
+        2.0,
+        5.0
+    ))
+
+    h, w = l.shape
+
+    tile_size = max(8, int(min(h, w) / 32))
+
+    clahe = cv2.createCLAHE(
+        clipLimit=adaptive_clip,
+        tileGridSize=(tile_size, tile_size)
+    )
+
+    enhanced_l = clahe.apply(l)
+
+    merged = cv2.merge([enhanced_l, a, b])
+
+    normalized = cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)
+
+    return normalized
 # -------------------------------------------------------------------------
 # UNIVERSAL PIPELINE CONTROLLER - ABSOLUTE LIVE ACCESSIBILITY FIX
 # -------------------------------------------------------------------------
+def hysteresis_threshold(diff, frame_gray, prev_mask=None):
+    """
+    Dual-threshold adaptive hysteresis based on ambient brightness.
+    """
+
+    B = float(np.mean(frame_gray))
+    sigma = float(np.std(frame_gray))
+
+    # Dynamic thresholds (core idea from your prompt)
+    T_high = np.clip(0.8 * B + 0.6 * sigma, 20, 180)
+    T_low  = np.clip(0.4 * B - 0.3 * sigma, 5, 120)
+
+    strong = (diff > T_high).astype(np.uint8)
+    weak = (diff > T_low).astype(np.uint8)
+
+    # Hysteresis propagation
+    if prev_mask is None:
+        prev_mask = np.zeros_like(diff, dtype=np.uint8)
+
+    # Keep strong edges
+    result = strong.copy()
+
+    # Keep weak pixels only if connected to strong
+    num_labels, labels = cv2.connectedComponents(weak)
+
+    for i in range(1, num_labels):
+        region = (labels == i)
+        if np.any(strong[region]):
+            result[region] = 1
+
+    # Temporal stability (very important for live stream)
+    result = cv2.addWeighted(result.astype(np.float32),
+                             0.7,
+                             prev_mask.astype(np.float32),
+                             0.3,
+                             0)
+
+    result = (result > 0.5).astype(np.uint8) * 255
+
+    return result
 def process_universal_pipeline(frame, texture_dropdown):
     global cached_texture_pattern, cached_final_composited, cached_simulated_frame, cached_confusion_mask, accumulated_mask, system_mode_tracker
+    global prev_low_res_hist
+    global ema_low_res_mask
 
     if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
         is_live_stream = False
@@ -157,7 +231,10 @@ def process_universal_pipeline(frame, texture_dropdown):
 
     low_res_w, low_res_h = 320, 240
     low_res = cv2.resize(frame, (low_res_w, low_res_h))
-
+    # -----------------------------------------------------------------
+    # AUTOMATED LIGHTING NORMALIZATION PREPROCESSOR
+    # -----------------------------------------------------------------
+    low_res = apply_adaptive_clahe(low_res)
     gray_low_res = cv2.cvtColor(low_res, cv2.COLOR_RGB2GRAY)
     mean_brightness, std_variance = cv2.meanStdDev(gray_low_res)
     mean_brightness = float(mean_brightness[0][0])
@@ -174,6 +251,12 @@ def process_universal_pipeline(frame, texture_dropdown):
 
     # محاكاة وحساب قناع الالتباس
     low_res_sim = simulate_deuteranopia(low_res)
+
+    # -------------------------------------------------------------------------
+    # ADVANCED PREPROCESSING MODULE:
+    # Adaptive CLAHE Illumination Normalization
+    # -------------------------------------------------------------------------
+
     orig_lab = cv2.cvtColor(low_res, cv2.COLOR_RGB2LAB)
     sim_lab = cv2.cvtColor(low_res_sim.astype(np.uint8), cv2.COLOR_RGB2LAB)
 
@@ -181,10 +264,44 @@ def process_universal_pipeline(frame, texture_dropdown):
     diff_a = cv2.absdiff(orig_lab[:, :, 1], sim_lab[:, :, 1])
     diff_b = cv2.absdiff(orig_lab[:, :, 2], sim_lab[:, :, 2])
     diff = cv2.addWeighted(diff_a, 1.0, diff_b, 1.0, 0)
+
+
+    # Gaussian smoothing لتحسين الاستقرار
     diff = cv2.GaussianBlur(diff, (5, 5), 0)
 
-    # تطبيق العتبة الحساسة الجديدة لمنع بقاء القناع أسود
-    _, low_res_mask = cv2.threshold(diff, adaptive_threshold, 255, cv2.THRESH_BINARY)
+    # Hysteresis mask
+    # Hysteresis (optional weak stabilization)
+    raw_mask = hysteresis_threshold(diff, gray_low_res, None)
+
+    # EMA memory (primary stabilization)
+    current_mask = raw_mask.astype(np.float32)
+
+    if ema_low_res_mask is None or ema_low_res_mask.shape != current_mask.shape:
+        ema_low_res_mask = current_mask.copy()
+    else:
+        alpha = np.clip(0.25 + (std_variance * 0.002), 0.2, 0.5)
+
+        ema_low_res_mask = alpha * current_mask + (1 - alpha) * ema_low_res_mask
+
+    low_res_mask = (ema_low_res_mask > 127).astype(np.uint8) * 255
+    # Convert to float for stable temporal filtering
+    current_mask = low_res_mask.astype(np.float32)
+
+    if ema_low_res_mask is None or ema_low_res_mask.shape != current_mask.shape:
+        ema_low_res_mask = current_mask.copy()
+    else:
+        alpha = np.clip(0.25 + (std_variance * 0.002), 0.2, 0.5) # responsiveness control
+
+        ema_low_res_mask = (
+                alpha * current_mask +
+                (1 - alpha) * ema_low_res_mask
+        )
+
+    # Re-binarize for downstream pipeline
+    low_res_mask = (ema_low_res_mask > 127).astype(np.uint8) * 255
+
+    # تحديث الذاكرة الزمنية
+    prev_low_res_hist = low_res_mask.copy()
 
     # تنظيف الضوضاء وفلترة الأشكال العشوائية الصغيرة
     num_labels, labels_im, stats, _ = cv2.connectedComponentsWithStats(low_res_mask)
@@ -207,8 +324,10 @@ def process_universal_pipeline(frame, texture_dropdown):
     else:
         accumulated_mask = filtered_low_res_mask.astype(np.float32)
 
+    acc_uint8 = cv2.normalize(accumulated_mask, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
     _, stabilized_low_res_mask = cv2.threshold(
-        accumulated_mask.astype(np.uint8),
+        acc_uint8,
         35,
         255,
         cv2.THRESH_BINARY
