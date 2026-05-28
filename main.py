@@ -1,4 +1,3 @@
-#--------------------------------------------------------------------------
 import io
 import cv2
 import requests
@@ -7,7 +6,7 @@ import gradio as gr
 from PIL import Image
 
 # -------------------------------------------------------------------------
-# MODULE 2 CORE: Computer Vision Algorithms
+# MODULE 2 CORE: Computer Vision Algorithms (محاكاة عمى الألوان والقناع)
 # -------------------------------------------------------------------------
 M = np.array([
     [0.430, 0.720, -0.150],
@@ -39,22 +38,21 @@ def get_confusion_mask(original, simulated, threshold=25):
 
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask = cv2.dilate(mask, kernel, iterations=2)
 
     return cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB)
 
 
 # -------------------------------------------------------------------------
-# MODULE 3: Generative AI Inpainting Engine (الذكاء الاصطناعي التوليدي)
+# MODULE 3: Generative AI Inpainting Engine (الاتصال بالذكاء الاصطناعي)
 # -------------------------------------------------------------------------
-# ملاحظة للمناقشة: ضعي مفتاح الـ Token الخاص بكِ من موقع Hugging Face هنا ليعمل الاتصال السحابي
-HF_API_TOKEN = "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"
+# تذكير: ضعي مفتاح التوكن الخاص بكِ هنا بين علامتي التنصيص ليعمل الاتصال السحابي
+HF_API_TOKEN = "your_hf_token_here"
 API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
 headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
 
 
 def numpy_to_bytes(img_array):
-    """تحويل المصفوفة البرمجية إلى بايتات مضغوطة لإرسالها عبر الإنترنت للموديل"""
     success, encoded_image = cv2.imencode('.png', img_array)
     if not success:
         raise ValueError("Could not encode image to PNG.")
@@ -62,17 +60,15 @@ def numpy_to_bytes(img_array):
 
 
 def generate_ai_texture_inpainting(original_rgb, binary_mask, texture_style="dots"):
-    """ترسل الصورة والقناع إلى السحابة لملء الفراغات بأنماط هندسية مخصصة"""
     prompt_mapping = {
-        "dots": "Clean minimalist monochrome micro-dot matrix pattern, uniform spacing, high contrast, fine vector lines",
-        "hatching": "Highly detailed fine monochrome cross-hatching geometric line pattern, crisp clean thin strokes",
-        "voronoi": "Organic Voronoi diagram cell pattern, ultra-fine monochrome continuous lines"
-    }
+    "dots": "Bold black and white geometric polka dot pattern, thick dark lines, solid high-contrast micro-dots, vector grid, sharp edges",
+    "hatching": "Coarse thick monochrome cross-hatching lines, high contrast black and white blueprint texture, sharp geometric strokes",
+    "voronoi": "Sharp black and white Voronoi tessellation cells, thick high-contrast dark continuous borders"
+}
 
     target_prompt = prompt_mapping.get(texture_style, prompt_mapping["dots"])
 
     try:
-        # تجهيز البيانات للإرسال
         image_bytes = numpy_to_bytes(original_rgb)
         mask_bytes = numpy_to_bytes(binary_mask)
 
@@ -82,12 +78,11 @@ def generate_ai_texture_inpainting(original_rgb, binary_mask, texture_style="dot
                 "mask_image": mask_bytes,
                 "prompt": target_prompt,
                 "negative_prompt": "blurry, colorful, ugly, chaotic, gradients, photorealistic background",
-                "num_inference_steps": 4,  # خطوات قليلة جداً لضمان السرعة الفائقة
+                "num_inference_steps": 4,
                 "guidance_scale": 1.5
             }
         }
 
-        # الاتصال بالخادم السحابي
         response = requests.post(API_URL, headers=headers, json=payload, timeout=10)
 
         if response.status_code == 200:
@@ -102,32 +97,65 @@ def generate_ai_texture_inpainting(original_rgb, binary_mask, texture_style="dot
 
 
 # -------------------------------------------------------------------------
-# INTERMEDIARY PIPELINE FUNCTION (دالة الربط المركزي)
+# MODULE 4: Matrix Fusion & Alpha Blending (كود الدمج الرياضي الشفاف الجديد)
+# -------------------------------------------------------------------------
+def apply_alpha_blending(original_rgb, ai_textured_rgb, binary_mask_rgb, alpha=0.35):
+    """تقوم بدمج أنماط الذكاء الاصطناعي فوق الصورة الأصلية فقط داخل حدود القناع الأبيض وبشفافية ناعمة"""
+    # التأكد من تطابق مقاسات الصور والقناع
+    if original_rgb.shape != ai_textured_rgb.shape or original_rgb.shape != binary_mask_rgb.shape:
+        ai_textured_rgb = cv2.resize(ai_textured_rgb, (original_rgb.shape[1], original_rgb.shape[0]))
+        binary_mask_rgb = cv2.resize(binary_mask_rgb, (original_rgb.shape[1], original_rgb.shape[0]))
+
+    # تحويل المصفوفات إلى float32 لمنع حدوث أخطاء حسابية أثناء الضرب والجمع
+    img_orig = original_rgb.astype(np.float32)
+    img_text = ai_textured_rgb.astype(np.float32)
+
+    # مصفوفة القناع العادي (تُحور القيم من 0-255 إلى نطاق الشفافية المطلوب 0.0 - 0.35)
+    normalized_mask = (binary_mask_rgb.astype(np.float32) / 255.0) * alpha
+
+    # تطبيق معادلة الدمج الرياضية: Final = (1 - Mask) * Original + Mask * Texture
+    blended_output = (1.0 - normalized_mask) * img_orig + normalized_mask * img_text
+
+    # إعادة القيم إلى النطاق الطبيعي للصورة 0-255 وتحويلها إلى نوع uint8
+    return np.clip(blended_output, 0, 255).astype(np.uint8)
+
+
+# -------------------------------------------------------------------------
+# INTERMEDIARY PIPELINE FUNCTION (الدالة الوسيطة للربط بين المراحل الأربعة)
 # -------------------------------------------------------------------------
 def process_static_image(frame, threshold_slider, texture_dropdown):
     if frame is None:
         return None, None, None, None
 
-    # 1. توليد محاكاة عمى الألوان
+    # المرحلة 2: محاكاة تجربة عمى الألوان
     simulated_frame = simulate_deuteranopia(frame)
 
-    # 2. استخراج قناع الالتباس البصري
+    # المرحلة 2 أيضاً: استخراج قناع المناطق الملتبسة
     confusion_mask = get_confusion_mask(frame, simulated_frame, threshold=threshold_slider)
 
-    # 3. استدعاء محرك الذكاء الاصطناعي لملء القناع بالنمط المختار
-    gray_mask = confusion_mask[:, :, 0]  # الموديل يتطلب قناع من قناة واحدة (رمادي)
+    # المرحلة 3: توليد النقوش عبر الذكاء الاصطناعي السحابي
+    gray_mask = confusion_mask[:, :, 0]
     ai_textured_output = generate_ai_texture_inpainting(frame, gray_mask, texture_style=texture_dropdown)
 
-    # في حال لم يتم وضع التوكن أو فشل الاتصال، تعرض الصورة الأصلية كحماية من التوقف
+    # حماية الكود: إذا كان التوكن خاطئاً أو لم يتصل بالسيرفر، نعتبر مخرجات الذكاء الاصطناعي هي نفس الصورة
     if ai_textured_output is None:
         ai_textured_output = frame
 
-    # نُعيد الآن 4 مخرجات لعرضها في الـ 4 شاشات بالواجهة
-    return frame, simulated_frame, confusion_mask, ai_textured_output
+    # المرحلة 4 (الجديدة): دمج النقوش فوق الصورة الأصلية بأسلوب الشفافية الذكية
+        # تعديل السطر في دالة process_static_image لزيادة قوة ظهور النمط:
+        final_composited_output = apply_alpha_blending(
+            original_rgb=frame,
+            ai_textured_rgb=ai_textured_output,
+            binary_mask_rgb=confusion_mask,
+            alpha=0.65  # رفع الشفافية يجعل خطوط ونقاط الذكاء الاصطناعي حادة وبارزة جداً
+        )
+
+    # إرسال المخرجات الأربعة إلى شاشات العرض الأربعة بالترتيب
+    return frame, simulated_frame, confusion_mask, final_composited_output
 
 
 # -------------------------------------------------------------------------
-# MODULE 1: Gradio UI Layout Dashboard (تصميم الواجهة)
+# MODULE 1: Gradio UI Layout Dashboard (الواجهة التفاعلية)
 # -------------------------------------------------------------------------
 with gr.Blocks(title="ChromaSight AI - Dashboard") as demo:
     gr.Markdown(
@@ -155,7 +183,6 @@ with gr.Blocks(title="ChromaSight AI - Dashboard") as demo:
                 label="CVD Classification Profile"
             )
 
-            # قائمة جديدة لاختيار شكل النقوش التوليدية حياً
             texture_dropdown = gr.Dropdown(
                 choices=["dots", "hatching", "voronoi"],
                 value="dots",
@@ -170,7 +197,7 @@ with gr.Blocks(title="ChromaSight AI - Dashboard") as demo:
                 label="Delta-E Sensitivity Threshold"
             )
 
-        # لوحة العرض الرباعية (يمين) - أضفنا الشاشة الرابعة للذكاء الاصطناعي
+        # لوحة العرض الرباعية (يمين)
         with gr.Column(scale=3):
             gr.Markdown("### 📊 Real-Time Pipeline Displays")
 
@@ -180,11 +207,12 @@ with gr.Blocks(title="ChromaSight AI - Dashboard") as demo:
 
             with gr.Row():
                 out_mask = gr.Image(label="3. Extracted Confusion Mask", interactive=False)
-                out_ai = gr.Image(label="4. GenAI Textured Inpainting Output", interactive=False)
+                # الشاشة الرابعة تعرض الآن النتيجة النهائية المدمجة بوضوح احترافي
+                out_final = gr.Image(label="4. Final Composited Accessibility Output (Module 4)", interactive=False)
 
-    # --- ربط أحداث التحديث التلقائي الفوري ---
+    # ربط أحداث التحديث التلقائي الفوري عند أي تغيير بالمتصفح
     inputs_list = [image_input, threshold_slider, texture_dropdown]
-    outputs_list = [out_orig, out_sim, out_mask, out_ai]
+    outputs_list = [out_orig, out_sim, out_mask, out_final]
 
     demo.load(fn=process_static_image, inputs=inputs_list, outputs=outputs_list)
     threshold_slider.change(fn=process_static_image, inputs=inputs_list, outputs=outputs_list)
@@ -192,5 +220,4 @@ with gr.Blocks(title="ChromaSight AI - Dashboard") as demo:
     image_input.change(fn=process_static_image, inputs=inputs_list, outputs=outputs_list)
 
 if __name__ == "__main__":
-    # تشغيل المشروع بالثيم الناعم والأنيق المعتمد أكاديمياً
     demo.launch(theme=gr.themes.Soft(), share=False)
