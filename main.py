@@ -4,9 +4,23 @@ import requests
 import numpy as np
 import gradio as gr
 from PIL import Image
+import threading
+import time
 
 # -------------------------------------------------------------------------
-# MODULE 2: Advanced Region-Based Vision Filters
+# GLOBAL PERFORMANCE & SCENE CACHE (ذاكرة الكاش ومستشعرات ثبات المشهد)
+# -------------------------------------------------------------------------
+cached_texture_pattern = None
+cached_final_composited = None
+cached_simulated_frame = None
+cached_confusion_mask = None
+
+prev_low_res_hist = None  # لتخزين البصمة اللونية للإطار السابق
+last_api_call_time = 0
+api_lock = threading.Lock()
+
+# -------------------------------------------------------------------------
+# MODULE 2 & 4: Core Core Math Engines
 # -------------------------------------------------------------------------
 M = np.array([
     [0.430, 0.720, -0.150],
@@ -18,70 +32,10 @@ M = np.array([
 def simulate_deuteranopia(frame):
     img = frame.astype(np.float32) / 255.0
     out = cv2.transform(img, M)
-    out = np.clip(out, 0, 1)
-    out = (out * 255).astype(np.uint8)
-    return out
+    return np.clip(out, 0, 1) * 255
 
 
-# -------------------------------------------------------------------------
-# MODULE 3: Generative AI Cloud Inpainting Engine
-# -------------------------------------------------------------------------
-HF_API_TOKEN = "your_hf_token_here"  # ضعي التوكن الخاص بكِ هنا
-API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
-headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-
-
-def numpy_to_bytes(img_array):
-    success, encoded_image = cv2.imencode('.png', img_array)
-    if not success:
-        raise ValueError("Could not encode image to PNG.")
-    return encoded_image.tobytes()
-
-
-def generate_ai_texture_inpainting(original_rgb, binary_mask, texture_style):
-    """يستقبل النمط الذي تم اختياره تلقائياً لكل إقليم ويولده سحابياً"""
-    prompt_mapping = {
-        "dots": "Clean minimalist monochrome micro-dot matrix pattern, uniform spacing, high contrast, fine vector lines",
-        "hatching": "Highly detailed fine monochrome cross-hatching geometric line pattern, crisp clean thin strokes",
-        "voronoi": "Organic Voronoi diagram cell pattern, ultra-fine monochrome continuous lines",
-        "wireframe": "Minimalist isometric wireframe grid pattern, thin sharp continuous lines"
-    }
-
-    target_prompt = prompt_mapping.get(texture_style, prompt_mapping["dots"])
-
-    try:
-        image_bytes = numpy_to_bytes(original_rgb)
-        mask_bytes = numpy_to_bytes(binary_mask)
-
-        payload = {
-            "inputs": {
-                "image": image_bytes,
-                "mask_image": mask_bytes,
-                "prompt": target_prompt,
-                "negative_prompt": "blurry, colorful, ugly, chaotic, gradients, photorealistic background",
-                "num_inference_steps": 4,
-                "guidance_scale": 1.5
-            }
-        }
-
-        response = requests.post(API_URL, headers=headers, json=payload, timeout=10)
-        if response.status_code == 200:
-            generated_image = Image.open(io.BytesIO(response.content)).convert("RGB")
-            return np.array(generated_image)
-        return None
-    except Exception as e:
-        print(f"Cloud Engine Offline: {e}")
-        return None
-
-
-# -------------------------------------------------------------------------
-# MODULE 4: Alpha Blending Matrix Fusion
-# -------------------------------------------------------------------------
-def apply_alpha_blending(original_rgb, ai_textured_rgb, binary_mask_rgb, alpha=0.45):
-    if original_rgb.shape != ai_textured_rgb.shape or original_rgb.shape != binary_mask_rgb.shape:
-        ai_textured_rgb = cv2.resize(ai_textured_rgb, (original_rgb.shape[1], original_rgb.shape[0]))
-        binary_mask_rgb = cv2.resize(binary_mask_rgb, (original_rgb.shape[1], original_rgb.shape[0]))
-
+def apply_alpha_blending(original_rgb, ai_textured_rgb, binary_mask_rgb, alpha=0.50):
     img_orig = original_rgb.astype(np.float32)
     img_text = ai_textured_rgb.astype(np.float32)
     normalized_mask = (binary_mask_rgb.astype(np.float32) / 255.0) * alpha
@@ -90,133 +44,183 @@ def apply_alpha_blending(original_rgb, ai_textured_rgb, binary_mask_rgb, alpha=0
 
 
 # -------------------------------------------------------------------------
-# CORE AUTOMATION: Shape Analyzer & Dynamic Pipeline
+# MODULE 3: Asynchronous Cloud Requester
 # -------------------------------------------------------------------------
-def process_dynamic_semantic_pipeline(frame, threshold_slider):
+HF_API_TOKEN = "your_hf_token_here"  # ضعي التوكن الخاص بكِ هنا
+API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+
+
+def fetch_ai_texture_async(low_res_frame, low_res_mask, texture_style):
+    global cached_texture_pattern
+    prompt_mapping = {
+        "dots": "Clean minimalist monochrome micro-dot matrix pattern, uniform spacing, high contrast, fine vector lines",
+        "hatching": "Highly detailed fine monochrome cross-hatching geometric line pattern, crisp clean thin strokes",
+        "voronoi": "Organic Voronoi diagram cell pattern, ultra-fine monochrome continuous lines"
+    }
+    try:
+        _, img_encoded = cv2.imencode('.png', low_res_frame)
+        _, mask_encoded = cv2.imencode('.png', low_res_mask)
+        payload = {
+            "inputs": {
+                "image": img_encoded.tobytes(),
+                "mask_image": mask_encoded.tobytes(),
+                "prompt": prompt_mapping.get(texture_style, "dots"),
+                "negative_prompt": "blurry, colorful, ugly, chaotic, gradients, photorealistic background",
+                "num_inference_steps": 4,
+                "guidance_scale": 1.0
+            }
+        }
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=5)
+        if response.status_code == 200:
+            generated_image = Image.open(io.BytesIO(response.content)).convert("RGB")
+            with api_lock:
+                cached_texture_pattern = np.array(generated_image)
+    except Exception as e:
+        print(f"Async Cloud Error: {e}")
+
+
+# -------------------------------------------------------------------------
+# LIGHTWEIGHT SCENE CHANGE DETECT ENGINE (خوارزمية كشف حركة المشهد)
+# -------------------------------------------------------------------------
+def is_scene_changed(current_low_res, threshold=0.98):
+    """
+    تقوم بحساب الهيستوجرام للإطار الحالي ومقارنته بالسابق.
+    ترجع True إذا تحركت الكاميرا، و False إذا كان المشهد ثابتاً.
+    """
+    global prev_low_res_hist
+
+    # حساب الهيستوجرام لقناة الألوان الأولى كمؤشر خفيف وسريع جداً للوزن الحسابي
+    hist = cv2.calcHist([current_low_res], [0], None, [64], [0, 256])
+    cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+
+    if prev_low_res_hist is None:
+        prev_low_res_hist = hist
+        return True  # أول فريم دائماً يعتبر مشهداً جديداً لتجهيز الكاش
+
+    # مقارنة الهيستوجرامين ببعضهما عبر دالة الارتباط الرياضي Correlation
+    similarity = cv2.compareHist(prev_low_res_hist, hist, cv2.HISTCMP_CORREL)
+    prev_low_res_hist = hist  # تحديث البصمة للفريم القادم
+
+    # إذا كانت نسبة التشابه أقل من العتبة (مثلاً 98%) فهناك حركة ملموسة بالمشهد
+    return similarity < threshold
+
+
+# -------------------------------------------------------------------------
+# REAL-TIME OPTIMIZED PIPELINE CONTROLLER WITH SCENE DETECTION
+# -------------------------------------------------------------------------
+def process_live_webcam_stream(frame, threshold_slider, texture_dropdown):
+    global cached_texture_pattern, cached_final_composited, cached_simulated_frame, cached_confusion_mask, last_api_call_time
+
     if frame is None:
-        return None, None, None, None, "No Region Detected"
+        return None, None, None, None, "Offline"
 
-    # 1. توليد محاكاة عمى الألوان الفورية
-    simulated_frame = simulate_deuteranopia(frame)
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    h, w, _ = frame.shape
 
-    # 2. حساب الفروقات اللونية لاستخراج القناع الأولي
-    orig_lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB)
-    sim_lab = cv2.cvtColor(simulated_frame, cv2.COLOR_RGB2LAB)
+    # 1. تصغير الأبعاد لتسريع الحسابات الرياضية والكشف
+    low_res = cv2.resize(frame, (320, 240))
+
+    # 2. تشغيل مستشعر الحركة الذكي (Scene Change Detection)
+    scene_has_changed = is_scene_changed(low_res, threshold=0.98)
+
+    if not scene_has_changed and cached_final_composited is not None:
+        # --- السحر البرمجي (REUSE CACHE) ---
+        # المشهد ثابت تماماً! نتخطى كل الحسابات ونعيد المخرجات السابقة فوراً في 0 ملي ثانية
+        status_text = "🟢 Static Scene: Reusing Memory Cache (FPS Maximized)"
+        return frame, cached_simulated_frame, cached_confusion_mask, cached_final_composited, status_text
+
+    # --- إذا تغير المشهد أو كنا في البداية، نقوم بالمعالجة الحقيقية ---
+    status_text = "⚡ Dynamic Scene: Reprocessing Pipeline Elements..."
+
+    # 3. محاكاة عمى الألوان الفورية
+    low_res_sim = simulate_deuteranopia(low_res)
+
+    # 4. استخراج القناع المصفى محلياً
+    orig_lab = cv2.cvtColor(low_res, cv2.COLOR_RGB2LAB)
+    sim_lab = cv2.cvtColor(low_res_sim.astype(np.uint8), cv2.COLOR_RGB2LAB)
     diff = cv2.addWeighted(cv2.absdiff(orig_lab[:, :, 1], sim_lab[:, :, 1]), 0.5,
                            cv2.absdiff(orig_lab[:, :, 2], sim_lab[:, :, 2]), 0.5, 0)
-    _, raw_mask = cv2.threshold(diff, threshold_slider, 255, cv2.THRESH_BINARY)
+    _, low_res_mask = cv2.threshold(diff, threshold_slider, 255, cv2.THRESH_BINARY)
 
-    # 3. محرك اتخاذ القرار الهندسي (Semantic Shape & Size Analyzer)
-    num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(raw_mask)
-
-    # مصفوفة القناع النهائي المصفى ونظام تتبع القرارات للشرح في التقرير
-    final_mask = np.zeros_like(raw_mask)
-    accumulated_textures = np.zeros_like(frame)
-    decision_log = []
-
-    # نحدد قيمة دنيا لحجم الأجسام لحذف النويز العشوائي (مثلاً 400 بكسل)
-    MIN_AREA = 400
-
+    num_labels, labels_im, stats, _ = cv2.connectedComponentsWithStats(low_res_mask)
+    filtered_low_res_mask = np.zeros_like(low_res_mask)
     for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
+        if stats[i, cv2.CC_STAT_AREA] > 150:
+            filtered_low_res_mask[labels_im == i] = 255
 
-        if area >= MIN_AREA:
-            # استخراج أبعاد الجسم الحالي (العرض والارتفاع)
-            width = stats[i, cv2.CC_STAT_WIDTH]
-            height = stats[i, cv2.CC_STAT_HEIGHT]
-            aspect_ratio = float(width) / height  # نسبة الاستطالة
+    # 5. إدارة طلب الذكاء الاصطناعي بشكل غير متزامن عند الحاجة فقط
+    current_time = time.time()
+    if (current_time - last_api_call_time > 3.0) and not api_lock.locked():
+        last_api_call_time = current_time
+        threading.Thread(
+            target=fetch_ai_texture_async,
+            args=(low_res, filtered_low_res_mask, texture_dropdown),
+            daemon=True
+        ).start()
 
-            # عزل الجسم الحالي في قناع منفصل مؤقت لتمريره للذكاء الاصطناعي
-            single_region_mask = np.zeros_like(raw_mask)
-            single_region_mask[labels_im == i] = 255
-            final_mask[labels_im == i] = 255
+    # 6. تكبير النتائج وحفظها في الكاش للفريمات القادمة
+    final_mask = cv2.resize(filtered_low_res_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    cached_confusion_mask = cv2.cvtColor(final_mask, cv2.COLOR_GRAY2RGB)
+    cached_simulated_frame = cv2.resize(low_res_sim, (w, h)).astype(np.uint8)
 
-            # تطبيق قواعد اتخاذ القرار (Decision Rules):
-            if aspect_ratio > 2.5 or aspect_ratio < 0.4:
-                # الكائنات الطولية والنحيفة جداً (مثل الخطوط، الحواف، النصوص)
-                chosen_style = "hatching"
-            elif area > 8000:
-                # الكائنات الضخمة جداً والمساحات العريضة (مثل البتلات الكبيرة)
-                chosen_style = "voronoi" if aspect_ratio > 0.8 else "wireframe"
-            elif area < 2500:
-                # الأقاليم المستديرة الصغيرة والبقع
-                chosen_style = "dots"
-            else:
-                # الأقاليم المتوسطة المتزنة
-                chosen_style = "dots"
+    if cached_texture_pattern is not None:
+        local_texture = cv2.resize(cached_texture_pattern, (w, h))
+    else:
+        local_texture = frame
 
-            decision_log.append(
-                f"Region {i}: Area={area}px, Ratio={aspect_ratio:.2f} -> Selected: [{chosen_style.upper()}]")
-
-            # استدعاء الذكاء الاصطناعي لمعالجة هذا الإقليم المحدد بالنمط المختار تلقائياً
-            textured_region = generate_ai_texture_inpainting(frame, single_region_mask, texture_style=chosen_style)
-
-            if textured_region is not None:
-                # دمج الجزء المحدث فقط داخل مصفوفة التجميع الكلية
-                idx = (single_region_mask == 255)
-                accumulated_textures[idx] = textured_region[idx]
-
-    # في حال فشل الاتصال أو عدم وجود كتل كبيرة، نضع الصورة الأصلية كخلفية للدمج
-    if np.sum(accumulated_textures) == 0:
-        accumulated_textures = frame
-
-    # 4. دمج مصفوفة الأنماط المجمعة هندسياً فوق الصورة الأصلية بشفافية
-    final_mask_rgb = cv2.cvtColor(final_mask, cv2.COLOR_GRAY2RGB)
-    final_composited_output = apply_alpha_blending(
+    cached_final_composited = apply_alpha_blending(
         original_rgb=frame,
-        ai_textured_rgb=accumulated_textures,
-        binary_mask_rgb=final_mask_rgb,
-        alpha=0.55
+        ai_textured_rgb=local_texture,
+        binary_mask_rgb=cached_confusion_mask,
+        alpha=0.60
     )
 
-    # تحويل سجل القرارات إلى نص منسق لعرضه أمام المشرفين في الواجهة
-    log_text = "\n".join(decision_log) if decision_log else "No valid functional regions met the scale parameters."
-
-    return frame, simulated_frame, final_mask_rgb, final_composited_output, log_text
+    return frame, cached_simulated_frame, cached_confusion_mask, cached_final_composited, status_text
 
 
 # -------------------------------------------------------------------------
-# MODULE 1: UI Layout Dashboard (الواجهة المحدثة لشاشات التقرير اللحظي)
+# MODULE 1: UI Layout Dashboard (واجهة العرض المحدثة)
 # -------------------------------------------------------------------------
-with gr.Blocks(title="ChromaSight AI - Semantic Dashboard") as demo:
+with gr.Blocks(title="ChromaSight AI - Smart Streaming") as demo:
     gr.Markdown(
         """
-        # 👁️ ChromaSight AI — Automated Semantic Architecture Dashboard
-        ### Advanced Prototype: Shape-Aware Structural Texture Customization Loop
+        # 👁️ ChromaSight AI — Smart Scene-Aware Webcam Dashboard
+        ### Full Pipeline Engine with Histogram-Driven Decision Cache Optimization
         """
     )
 
     with gr.Row():
-        # الجانب الأيسر للتحكم والمراقبة الذكية
         with gr.Column(scale=1):
             gr.Markdown("### 🛠️ System Configurations")
 
-            image_input = gr.Image(value="test.jpg", type="numpy", label="Input Image (test.jpg)")
+            webcam_input = gr.Image(sources=["webcam"], type="numpy", streaming=True, label="Active Video Buffer")
+            texture_dropdown = gr.Dropdown(choices=["dots", "hatching", "voronoi"], value="dots",
+                                           label="AI Texture Pattern Style")
             threshold_slider = gr.Slider(minimum=5, maximum=60, value=25, step=1, label="Delta-E Sensitivity Threshold")
 
-            gr.Markdown("### 📜 System Decision Log (سجل قرارات النظام اللحظي)")
-            # صندوق نصي تفاعلي يظهر للجنة المناقشة كيف يفكر الكود ويختار الأنماط برمجياً
-            output_log = gr.Textbox(label="Automated Assignment Telemetry", interactive=False, lines=10)
+            gr.Markdown("### 📡 Pipeline Optimization Telemetry")
+            # صندوق نصي تفاعلي يثبت للمناقشين حالة توفير الطاقة واستخدام الكاش حياً
+            scene_telemetry = gr.Textbox(label="Scene Detection Telemetry", interactive=False, lines=2)
 
-        # الجانب الأيمن للعرض الرباعي
         with gr.Column(scale=3):
             gr.Markdown("### 📊 Real-Time Pipeline Displays")
 
             with gr.Row():
-                out_orig = gr.Image(label="1. Original Image", interactive=False)
+                out_orig = gr.Image(label="1. Original Live Stream", interactive=False)
                 out_sim = gr.Image(label="2. Perceptual CVD Simulation", interactive=False)
 
             with gr.Row():
-                out_mask = gr.Image(label="3. Geometrically Filtered Mask", interactive=False)
-                out_final = gr.Image(label="4. Semantically Textured Output (Module 4)", interactive=False)
+                out_mask = gr.Image(label="3. Extracted Confusion Mask", interactive=False)
+                out_final = gr.Image(label="4. Final Composited Accessibility Output (Module 4)", interactive=False)
 
-    # ربط الأحداث للتحديث الفوري التلقائي
-    inputs_list = [image_input, threshold_slider]
-    outputs_list = [out_orig, out_sim, out_mask, out_final, output_log]
-
-    demo.load(fn=process_dynamic_semantic_pipeline, inputs=inputs_list, outputs=outputs_list)
-    threshold_slider.change(fn=process_dynamic_semantic_pipeline, inputs=inputs_list, outputs=outputs_list)
-    image_input.change(fn=process_dynamic_semantic_pipeline, inputs=inputs_list, outputs=outputs_list)
+    webcam_input.stream(
+        fn=process_live_webcam_stream,
+        inputs=[webcam_input, threshold_slider, texture_dropdown],
+        outputs=[out_orig, out_sim, out_mask, out_final, scene_telemetry],
+        queue=True,
+        time_limit=15
+    )
 
 if __name__ == "__main__":
     demo.launch(theme=gr.themes.Soft(), share=False)
