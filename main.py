@@ -8,14 +8,14 @@ import threading
 import time
 
 # -------------------------------------------------------------------------
-# GLOBAL PERFORMANCE & SCENE CACHE (ذاكرة الكاش ومستشعرات ثبات المشهد)
+# GLOBAL PERFORMANCE & SCENE CACHE
 # -------------------------------------------------------------------------
 cached_texture_pattern = None
 cached_final_composited = None
 cached_simulated_frame = None
 cached_confusion_mask = None
 
-prev_low_res_hist = None  # لتخزين البصمة اللونية للإطار السابق
+prev_low_res_hist = None
 last_api_call_time = 0
 api_lock = threading.Lock()
 
@@ -35,7 +35,7 @@ def simulate_deuteranopia(frame):
     return np.clip(out, 0, 1) * 255
 
 
-def apply_alpha_blending(original_rgb, ai_textured_rgb, binary_mask_rgb, alpha=0.50):
+def apply_alpha_blending(original_rgb, ai_textured_rgb, binary_mask_rgb, alpha):
     img_orig = original_rgb.astype(np.float32)
     img_text = ai_textured_rgb.astype(np.float32)
     normalized_mask = (binary_mask_rgb.astype(np.float32) / 255.0) * alpha
@@ -81,67 +81,84 @@ def fetch_ai_texture_async(low_res_frame, low_res_mask, texture_style):
 
 
 # -------------------------------------------------------------------------
-# LIGHTWEIGHT SCENE CHANGE DETECT ENGINE (خوارزمية كشف حركة المشهد)
+# LIGHTWEIGHT SCENE CHANGE DETECT ENGINE
 # -------------------------------------------------------------------------
-def is_scene_changed(current_low_res, threshold=0.98):
-    """
-    تقوم بحساب الهيستوجرام للإطار الحالي ومقارنته بالسابق.
-    ترجع True إذا تحركت الكاميرا، و False إذا كان المشهد ثابتاً.
-    """
+def calculate_scene_similarity(current_low_res):
     global prev_low_res_hist
-
-    # حساب الهيستوجرام لقناة الألوان الأولى كمؤشر خفيف وسريع جداً للوزن الحسابي
     hist = cv2.calcHist([current_low_res], [0], None, [64], [0, 256])
     cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
 
     if prev_low_res_hist is None:
         prev_low_res_hist = hist
-        return True  # أول فريم دائماً يعتبر مشهداً جديداً لتجهيز الكاش
+        return 0.0  # مشهد جديد بالكامل
 
-    # مقارنة الهيستوجرامين ببعضهما عبر دالة الارتباط الرياضي Correlation
     similarity = cv2.compareHist(prev_low_res_hist, hist, cv2.HISTCMP_CORREL)
-    prev_low_res_hist = hist  # تحديث البصمة للفريم القادم
-
-    # إذا كانت نسبة التشابه أقل من العتبة (مثلاً 98%) فهناك حركة ملموسة بالمشهد
-    return similarity < threshold
+    prev_low_res_hist = hist
+    return similarity
 
 
 # -------------------------------------------------------------------------
-# REAL-TIME OPTIMIZED PIPELINE CONTROLLER WITH SCENE DETECTION
+# REAL-TIME ADAPTIVE PIPELINE CONTROLLER (محرك المعايرة الذاتية والتكيف)
 # -------------------------------------------------------------------------
-def process_live_webcam_stream(frame, threshold_slider, texture_dropdown):
+def process_live_webcam_stream(frame, texture_dropdown):
     global cached_texture_pattern, cached_final_composited, cached_simulated_frame, cached_confusion_mask, last_api_call_time
 
     if frame is None:
-        return None, None, None, None, "Offline"
+        return None, None, None, None, "Offline Telemetry"
 
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     h, w, _ = frame.shape
 
-    # 1. تصغير الأبعاد لتسريع الحسابات الرياضية والكشف
+    # 1. تصغير الأبعاد السريع
     low_res = cv2.resize(frame, (320, 240))
 
-    # 2. تشغيل مستشعر الحركة الذكي (Scene Change Detection)
-    scene_has_changed = is_scene_changed(low_res, threshold=0.98)
+    # 2. خطوة التحليل الإحصائي للبيئة المحيطة (Adaptive Tuning Calculation)
+    # حساب متوسط السطوع والانحراف المعياري للألوان محلياً في أجزاء من الملي ثانية
+    gray_low_res = cv2.cvtColor(low_res, cv2.COLOR_RGB2GRAY)
+    mean_brightness, std_variance = cv2.meanStdDev(gray_low_res)
+    mean_brightness = float(mean_brightness[0][0])
+    std_variance = float(std_variance[0][0])
+
+    # معادلات التكيف الذاتي (Mathematical Mapping Profiles):
+    # أ) عتبة القناع تتناسب عكسياً مع الإضاءة (إضاءة خافتة تعني حساسية أعلى = threshold منخفض)
+    adaptive_threshold = int(np.clip(35 - (mean_brightness * 0.1), 12, 45))
+
+    # ب) معامل الدمج يتناسب طردياً مع تشتت الألوان لضمان بروز النمط في البيئات المعقدة
+    adaptive_alpha = float(np.clip(0.20 + (std_variance * 0.008), 0.30, 0.75))
+
+    # ج) عتبة حركة المشهد تتوازن مع السطوع لمنع نويز الظلال من تدمير الكاش
+    adaptive_scene_limit = float(np.clip(0.97 + (mean_brightness * 0.0001), 0.96, 0.99))
+
+    # 3. فحص حركة المشهد بناءً على العتبة التكيفية المستخرجة
+    scene_similarity = calculate_scene_similarity(low_res)
+    scene_has_changed = scene_similarity < adaptive_scene_limit
 
     if not scene_has_changed and cached_final_composited is not None:
-        # --- السحر البرمجي (REUSE CACHE) ---
-        # المشهد ثابت تماماً! نتخطى كل الحسابات ونعيد المخرجات السابقة فوراً في 0 ملي ثانية
-        status_text = "🟢 Static Scene: Reusing Memory Cache (FPS Maximized)"
+        # استخدام الكاش عند ثبات الغرفة لتوفير طاقة المعالج واختصار الوقت
+        status_text = (
+            f"🟢 STATIC SCENE BOUNDARIES | Reusing Memory Cache\n"
+            f"📊 Environment Parameters: Brightness={mean_brightness:.1f} | Variance={std_variance:.1f}\n"
+            f"⚙️ Tuning Profile: Threshold={adaptive_threshold} | Blending Alpha={adaptive_alpha:.2f}"
+        )
         return frame, cached_simulated_frame, cached_confusion_mask, cached_final_composited, status_text
 
-    # --- إذا تغير المشهد أو كنا في البداية، نقوم بالمعالجة الحقيقية ---
-    status_text = "⚡ Dynamic Scene: Reprocessing Pipeline Elements..."
+    # 4. إذا رصد النظام تغيراً بيئياً حقيقياً، يعيد ضبط المصفوفات فوراً
+    status_text = (
+        f"⚡ ADAPTIVE TUNING COMPLETED | Reprocessing Pipeline Matrix\n"
+        f"📊 Environment Parameters: Brightness={mean_brightness:.1f} | Variance={std_variance:.1f}\n"
+        f"⚙️ Applied Profile: Threshold={adaptive_threshold} | Blending Alpha={adaptive_alpha:.2f}"
+    )
 
-    # 3. محاكاة عمى الألوان الفورية
+    # 5. محاكاة واستخراج قناع الالتباس الفوري باستخدام العتبة الذكية المستخرجة
     low_res_sim = simulate_deuteranopia(low_res)
 
-    # 4. استخراج القناع المصفى محلياً
     orig_lab = cv2.cvtColor(low_res, cv2.COLOR_RGB2LAB)
     sim_lab = cv2.cvtColor(low_res_sim.astype(np.uint8), cv2.COLOR_RGB2LAB)
     diff = cv2.addWeighted(cv2.absdiff(orig_lab[:, :, 1], sim_lab[:, :, 1]), 0.5,
                            cv2.absdiff(orig_lab[:, :, 2], sim_lab[:, :, 2]), 0.5, 0)
-    _, low_res_mask = cv2.threshold(diff, threshold_slider, 255, cv2.THRESH_BINARY)
+
+    # تطبيق الـ threshold الذي تم حسابه ذاتياً
+    _, low_res_mask = cv2.threshold(diff, adaptive_threshold, 255, cv2.THRESH_BINARY)
 
     num_labels, labels_im, stats, _ = cv2.connectedComponentsWithStats(low_res_mask)
     filtered_low_res_mask = np.zeros_like(low_res_mask)
@@ -149,7 +166,7 @@ def process_live_webcam_stream(frame, threshold_slider, texture_dropdown):
         if stats[i, cv2.CC_STAT_AREA] > 150:
             filtered_low_res_mask[labels_im == i] = 255
 
-    # 5. إدارة طلب الذكاء الاصطناعي بشكل غير متزامن عند الحاجة فقط
+    # 6. تحديث طلبات الذكاء الاصطناعي بشكل خلفي غير متزامن
     current_time = time.time()
     if (current_time - last_api_call_time > 3.0) and not api_lock.locked():
         last_api_call_time = current_time
@@ -159,7 +176,7 @@ def process_live_webcam_stream(frame, threshold_slider, texture_dropdown):
             daemon=True
         ).start()
 
-    # 6. تكبير النتائج وحفظها في الكاش للفريمات القادمة
+    # 7. التكبير والدمج الشفاف الفوري بناءً على معامل الـ Alpha التكيفي المستخرج
     final_mask = cv2.resize(filtered_low_res_mask, (w, h), interpolation=cv2.INTER_NEAREST)
     cached_confusion_mask = cv2.cvtColor(final_mask, cv2.COLOR_GRAY2RGB)
     cached_simulated_frame = cv2.resize(low_res_sim, (w, h)).astype(np.uint8)
@@ -169,39 +186,39 @@ def process_live_webcam_stream(frame, threshold_slider, texture_dropdown):
     else:
         local_texture = frame
 
+    # استخدام الـ alpha الذي تم حسابه ذاتياً للتكيف البصري
     cached_final_composited = apply_alpha_blending(
         original_rgb=frame,
         ai_textured_rgb=local_texture,
         binary_mask_rgb=cached_confusion_mask,
-        alpha=0.60
+        alpha=adaptive_alpha
     )
 
     return frame, cached_simulated_frame, cached_confusion_mask, cached_final_composited, status_text
 
 
 # -------------------------------------------------------------------------
-# MODULE 1: UI Layout Dashboard (واجهة العرض المحدثة)
+# MODULE 1: UI Layout Dashboard (الواجهة الأوتوماتيكية الكاملة)
 # -------------------------------------------------------------------------
-with gr.Blocks(title="ChromaSight AI - Smart Streaming") as demo:
+with gr.Blocks(title="ChromaSight AI - Adaptive Framework") as demo:
     gr.Markdown(
         """
-        # 👁️ ChromaSight AI — Smart Scene-Aware Webcam Dashboard
-        ### Full Pipeline Engine with Histogram-Driven Decision Cache Optimization
+        # 👁️ ChromaSight AI — Autonomous Self-Tuning Adaptive Framework
+        ### Closed-Loop Computer Vision Pipeline with Real-Time Environmental Parameter Mapping
         """
     )
 
     with gr.Row():
         with gr.Column(scale=1):
-            gr.Markdown("### 🛠️ System Configurations")
+            gr.Markdown("### 🛠️ Automation Controls")
 
             webcam_input = gr.Image(sources=["webcam"], type="numpy", streaming=True, label="Active Video Buffer")
             texture_dropdown = gr.Dropdown(choices=["dots", "hatching", "voronoi"], value="dots",
                                            label="AI Texture Pattern Style")
-            threshold_slider = gr.Slider(minimum=5, maximum=60, value=25, step=1, label="Delta-E Sensitivity Threshold")
 
-            gr.Markdown("### 📡 Pipeline Optimization Telemetry")
-            # صندوق نصي تفاعلي يثبت للمناقشين حالة توفير الطاقة واستخدام الكاش حياً
-            scene_telemetry = gr.Textbox(label="Scene Detection Telemetry", interactive=False, lines=2)
+            gr.Markdown("### 📡 Real-Time Calibration Telemetry")
+            # شاشة عرض تقارير التعديل التلقائي التي تعكس تفكير النظام التكيفي أمام الحضور
+            scene_telemetry = gr.Textbox(label="Adaptive Calibration Monitor", interactive=False, lines=4)
 
         with gr.Column(scale=3):
             gr.Markdown("### 📊 Real-Time Pipeline Displays")
@@ -211,12 +228,12 @@ with gr.Blocks(title="ChromaSight AI - Smart Streaming") as demo:
                 out_sim = gr.Image(label="2. Perceptual CVD Simulation", interactive=False)
 
             with gr.Row():
-                out_mask = gr.Image(label="3. Extracted Confusion Mask", interactive=False)
-                out_final = gr.Image(label="4. Final Composited Accessibility Output (Module 4)", interactive=False)
+                out_mask = gr.Image(label="3. Dynamic Autotuned Mask", interactive=False)
+                out_final = gr.Image(label="4. Adaptive Composited Output (Module 4)", interactive=False)
 
     webcam_input.stream(
         fn=process_live_webcam_stream,
-        inputs=[webcam_input, threshold_slider, texture_dropdown],
+        inputs=[webcam_input, texture_dropdown],
         outputs=[out_orig, out_sim, out_mask, out_final, scene_telemetry],
         queue=True,
         time_limit=15
