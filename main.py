@@ -23,7 +23,12 @@ def simulate_deuteranopia(frame):
     return out
 
 
-def get_confusion_mask(original, simulated, threshold=25):
+def get_confusion_mask(original, simulated, threshold=25, min_area_size=500):
+    """
+    نسخة مطورة برؤية كلاسيكية: تستخرج القناع ثم تعزل الأجسام المتماسكة
+    وتحذف النويز والبكسلات العشوائية بناءً على المساحة (Connected Components).
+    """
+    # 1. الحسابات التقليدية لفضاء LAB واستخراج الفروقات
     orig_lab = cv2.cvtColor(original, cv2.COLOR_RGB2LAB)
     sim_lab = cv2.cvtColor(simulated, cv2.COLOR_RGB2LAB)
 
@@ -34,14 +39,35 @@ def get_confusion_mask(original, simulated, threshold=25):
     diff_b = cv2.absdiff(orig_b, sim_b)
     diff = cv2.addWeighted(diff_a, 0.5, diff_b, 0.5, 0)
 
-    _, mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+    # 2. تحويل الفروقات إلى قناع ثنائي (أبيض وأسود)
+    _, raw_mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
 
+    # 3. خطوة السحر الكلاسيكي: تحليل المكونات المتصلة لعزل الأقاليم
+    # num_labels: عدد الأجسام المكتشفة
+    # labels_im: مصفوفة تشبه الصورة ولكن كل جسم له رقم (الجسم الأول بكسلاته تحمل رقم 1، الثاني رقم 2 وهكذا)
+    # stats: تحتوي على معلومات كل جسم (بما في ذلك مساحته بالبكسل في العامود الأخير cv2.CC_STAT_AREA)
+    num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(raw_mask)
+
+    # إنشاء قناع جديد نظيف وفارغ تماماً وضخ الكتل المتماسكة داخله
+    cleaned_mask = np.zeros_like(raw_mask)
+
+    # المرور على كل الأجسام المكتشفة (نبدأ من 1 لأن الرقم 0 هو الخلفية السوداء دائماً)
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]  # استخراج مساحة الجسم الحالي بالبكسل
+
+        # شرط تماسك الكائن (Object Consistency):
+        # إذا كانت مساحة الكتلة البيضاء أكبر من الحجم المحدد (مثلاً 500 بكسل)، نعتبرها كائناً حقيقياً ونبقي عليها
+        if area >= min_area_size:
+            # دمج هذا الكائن المتصل داخل القناع النظيف
+            cleaned_mask[labels_im == i] = 255
+
+    # 4. تحسين الحواف للأجسام المتبقية لجعلها ناعمة ومتناسقة للذكاء الاصطناعي
     kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.dilate(mask, kernel, iterations=2)
+    cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_CLOSE, kernel)
+    cleaned_mask = cv2.dilate(cleaned_mask, kernel, iterations=1)
 
-    return cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB)
-
+    # إرجاع القناع المطور على مستوى الأقاليم كـ 3 قنوات للواجهة
+    return cv2.cvtColor(cleaned_mask, cv2.COLOR_GRAY2RGB)
 
 # -------------------------------------------------------------------------
 # MODULE 3: Generative AI Inpainting Engine (الاتصال بالذكاء الاصطناعي)
