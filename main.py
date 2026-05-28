@@ -8,7 +8,7 @@ import threading
 import time
 
 # -------------------------------------------------------------------------
-# GLOBAL PERFORMANCE & SCENE CACHE
+# GLOBAL PERFORMANCE, SCENE, & TEMPORAL CACHE
 # -------------------------------------------------------------------------
 cached_texture_pattern = None
 cached_final_composited = None
@@ -16,6 +16,7 @@ cached_simulated_frame = None
 cached_confusion_mask = None
 
 prev_low_res_hist = None
+accumulated_mask = None
 last_api_call_time = 0
 api_lock = threading.Lock()
 
@@ -90,7 +91,7 @@ def calculate_scene_similarity(current_low_res):
 
     if prev_low_res_hist is None:
         prev_low_res_hist = hist
-        return 0.0  # مشهد جديد بالكامل
+        return 0.0
 
     similarity = cv2.compareHist(prev_low_res_hist, hist, cv2.HISTCMP_CORREL)
     prev_low_res_hist = hist
@@ -98,10 +99,10 @@ def calculate_scene_similarity(current_low_res):
 
 
 # -------------------------------------------------------------------------
-# REAL-TIME ADAPTIVE PIPELINE CONTROLLER (محرك المعايرة الذاتية والتكيف)
+# REAL-TIME ADAPTIVE PIPELINE CONTROLLER WITH BILATERAL SMOOTHING
 # -------------------------------------------------------------------------
 def process_live_webcam_stream(frame, texture_dropdown):
-    global cached_texture_pattern, cached_final_composited, cached_simulated_frame, cached_confusion_mask, last_api_call_time
+    global cached_texture_pattern, cached_final_composited, cached_simulated_frame, cached_confusion_mask, accumulated_mask, last_api_call_time
 
     if frame is None:
         return None, None, None, None, "Offline Telemetry"
@@ -112,52 +113,32 @@ def process_live_webcam_stream(frame, texture_dropdown):
     # 1. تصغير الأبعاد السريع
     low_res = cv2.resize(frame, (320, 240))
 
-    # 2. خطوة التحليل الإحصائي للبيئة المحيطة (Adaptive Tuning Calculation)
-    # حساب متوسط السطوع والانحراف المعياري للألوان محلياً في أجزاء من الملي ثانية
+    # 2. التحليل الإحصائي والتكيف الذاتي
     gray_low_res = cv2.cvtColor(low_res, cv2.COLOR_RGB2GRAY)
     mean_brightness, std_variance = cv2.meanStdDev(gray_low_res)
     mean_brightness = float(mean_brightness[0][0])
     std_variance = float(std_variance[0][0])
 
-    # معادلات التكيف الذاتي (Mathematical Mapping Profiles):
-    # أ) عتبة القناع تتناسب عكسياً مع الإضاءة (إضاءة خافتة تعني حساسية أعلى = threshold منخفض)
     adaptive_threshold = int(np.clip(35 - (mean_brightness * 0.1), 12, 45))
-
-    # ب) معامل الدمج يتناسب طردياً مع تشتت الألوان لضمان بروز النمط في البيئات المعقدة
     adaptive_alpha = float(np.clip(0.20 + (std_variance * 0.008), 0.30, 0.75))
-
-    # ج) عتبة حركة المشهد تتوازن مع السطوع لمنع نويز الظلال من تدمير الكاش
     adaptive_scene_limit = float(np.clip(0.97 + (mean_brightness * 0.0001), 0.96, 0.99))
 
-    # 3. فحص حركة المشهد بناءً على العتبة التكيفية المستخرجة
+    # 3. فحص حركة المشهد
     scene_similarity = calculate_scene_similarity(low_res)
     scene_has_changed = scene_similarity < adaptive_scene_limit
 
     if not scene_has_changed and cached_final_composited is not None:
-        # استخدام الكاش عند ثبات الغرفة لتوفير طاقة المعالج واختصار الوقت
-        status_text = (
-            f"🟢 STATIC SCENE BOUNDARIES | Reusing Memory Cache\n"
-            f"📊 Environment Parameters: Brightness={mean_brightness:.1f} | Variance={std_variance:.1f}\n"
-            f"⚙️ Tuning Profile: Threshold={adaptive_threshold} | Blending Alpha={adaptive_alpha:.2f}"
-        )
+        status_text = "🟢 STATIC BOUNDARIES | Spatial Bilateral Smoothing Cached"
         return frame, cached_simulated_frame, cached_confusion_mask, cached_final_composited, status_text
 
-    # 4. إذا رصد النظام تغيراً بيئياً حقيقياً، يعيد ضبط المصفوفات فوراً
-    status_text = (
-        f"⚡ ADAPTIVE TUNING COMPLETED | Reprocessing Pipeline Matrix\n"
-        f"📊 Environment Parameters: Brightness={mean_brightness:.1f} | Variance={std_variance:.1f}\n"
-        f"⚙️ Applied Profile: Threshold={adaptive_threshold} | Blending Alpha={adaptive_alpha:.2f}"
-    )
+    status_text = "⚡ ADAPTIVE PROCESSING | Applying Edge-Preserving Bilateral Filter..."
 
-    # 5. محاكاة واستخراج قناع الالتباس الفوري باستخدام العتبة الذكية المستخرجة
+    # 4. محاكاة واستخراج قناع الالتباس اللحظي
     low_res_sim = simulate_deuteranopia(low_res)
-
     orig_lab = cv2.cvtColor(low_res, cv2.COLOR_RGB2LAB)
     sim_lab = cv2.cvtColor(low_res_sim.astype(np.uint8), cv2.COLOR_RGB2LAB)
     diff = cv2.addWeighted(cv2.absdiff(orig_lab[:, :, 1], sim_lab[:, :, 1]), 0.5,
                            cv2.absdiff(orig_lab[:, :, 2], sim_lab[:, :, 2]), 0.5, 0)
-
-    # تطبيق الـ threshold الذي تم حسابه ذاتياً
     _, low_res_mask = cv2.threshold(diff, adaptive_threshold, 255, cv2.THRESH_BINARY)
 
     num_labels, labels_im, stats, _ = cv2.connectedComponentsWithStats(low_res_mask)
@@ -166,18 +147,30 @@ def process_live_webcam_stream(frame, texture_dropdown):
         if stats[i, cv2.CC_STAT_AREA] > 150:
             filtered_low_res_mask[labels_im == i] = 255
 
-    # 6. تحديث طلبات الذكاء الاصطناعي بشكل خلفي غير متزامن
+    # 5. التثبيت الزمني للمصفوفة
+    if accumulated_mask is None or accumulated_mask.shape != filtered_low_res_mask.shape:
+        accumulated_mask = filtered_low_res_mask.astype(np.float32)
+    else:
+        cv2.accumulateWeighted(filtered_low_res_mask, accumulated_mask, 0.15)
+
+    stabilized_low_res_mask = cv2.threshold(accumulated_mask.astype(np.uint8), 127, 255, cv2.THRESH_BINARY)[1]
+
+    # 6. الميزة الجديدة (Edge-Preserving Spatial Smoothing):
+    # تطبيق الفلتر الثنائي لضمان عدم خروج النقوش عن حواف الجسم الخلفية وحمايتها من التشويه
+    smoothed_low_res_mask = cv2.bilateralFilter(stabilized_low_res_mask, d=5, sigmaColor=75, sigmaSpace=75)
+
+    # 7. تحديث طلبات الذكاء الاصطناعي بشكل خلفي غير متزامن
     current_time = time.time()
     if (current_time - last_api_call_time > 3.0) and not api_lock.locked():
         last_api_call_time = current_time
         threading.Thread(
             target=fetch_ai_texture_async,
-            args=(low_res, filtered_low_res_mask, texture_dropdown),
+            args=(low_res, smoothed_low_res_mask, texture_dropdown),
             daemon=True
         ).start()
 
-    # 7. التكبير والدمج الشفاف الفوري بناءً على معامل الـ Alpha التكيفي المستخرج
-    final_mask = cv2.resize(filtered_low_res_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    # 8. التكبير النهائي والدمج الشفاف المستقر والمنعم حوافه
+    final_mask = cv2.resize(smoothed_low_res_mask, (w, h), interpolation=cv2.INTER_NEAREST)
     cached_confusion_mask = cv2.cvtColor(final_mask, cv2.COLOR_GRAY2RGB)
     cached_simulated_frame = cv2.resize(low_res_sim, (w, h)).astype(np.uint8)
 
@@ -186,7 +179,6 @@ def process_live_webcam_stream(frame, texture_dropdown):
     else:
         local_texture = frame
 
-    # استخدام الـ alpha الذي تم حسابه ذاتياً للتكيف البصري
     cached_final_composited = apply_alpha_blending(
         original_rgb=frame,
         ai_textured_rgb=local_texture,
@@ -198,38 +190,34 @@ def process_live_webcam_stream(frame, texture_dropdown):
 
 
 # -------------------------------------------------------------------------
-# MODULE 1: UI Layout Dashboard (الواجهة الأوتوماتيكية الكاملة)
+# MODULE 1: UI Layout Dashboard
 # -------------------------------------------------------------------------
-with gr.Blocks(title="ChromaSight AI - Adaptive Framework") as demo:
+with gr.Blocks(title="ChromaSight AI - Smooth Boundaries") as demo:
     gr.Markdown(
         """
-        # 👁️ ChromaSight AI — Autonomous Self-Tuning Adaptive Framework
-        ### Closed-Loop Computer Vision Pipeline with Real-Time Environmental Parameter Mapping
+        # 👁️ ChromaSight AI — Edge-Preserving Bilateral Smoothing Framework
+        ### Advanced Spatial Filtering to Eliminate Texture Bleeding and Optimize Structural Contrast
         """
     )
 
     with gr.Row():
         with gr.Column(scale=1):
-            gr.Markdown("### 🛠️ Automation Controls")
-
+            gr.Markdown("### 🛠️ System Interface")
             webcam_input = gr.Image(sources=["webcam"], type="numpy", streaming=True, label="Active Video Buffer")
             texture_dropdown = gr.Dropdown(choices=["dots", "hatching", "voronoi"], value="dots",
                                            label="AI Texture Pattern Style")
 
-            gr.Markdown("### 📡 Real-Time Calibration Telemetry")
-            # شاشة عرض تقارير التعديل التلقائي التي تعكس تفكير النظام التكيفي أمام الحضور
-            scene_telemetry = gr.Textbox(label="Adaptive Calibration Monitor", interactive=False, lines=4)
+            gr.Markdown("### 📡 Telemetry Monitor")
+            scene_telemetry = gr.Textbox(label="Spatial Filter Metrics", interactive=False, lines=4)
 
         with gr.Column(scale=3):
-            gr.Markdown("### 📊 Real-Time Pipeline Displays")
-
+            gr.Markdown("### 📊 Stabilized Live Displays")
             with gr.Row():
                 out_orig = gr.Image(label="1. Original Live Stream", interactive=False)
                 out_sim = gr.Image(label="2. Perceptual CVD Simulation", interactive=False)
-
             with gr.Row():
-                out_mask = gr.Image(label="3. Dynamic Autotuned Mask", interactive=False)
-                out_final = gr.Image(label="4. Adaptive Composited Output (Module 4)", interactive=False)
+                out_mask = gr.Image(label="3. Bilateral Smoothed Mask", interactive=False)
+                out_final = gr.Image(label="4. Edge-Locked Composited Output", interactive=False)
 
     webcam_input.stream(
         fn=process_live_webcam_stream,
