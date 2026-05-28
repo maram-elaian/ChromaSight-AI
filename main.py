@@ -47,7 +47,7 @@ def apply_alpha_blending(original_rgb, ai_textured_rgb, binary_mask_rgb, alpha):
 # -------------------------------------------------------------------------
 # MODULE 3: Asynchronous Cloud Requester
 # -------------------------------------------------------------------------
-HF_API_TOKEN = "your_hf_token_here"  # ضعي التوكن الخاص بكِ هنا
+HF_API_TOKEN = "your_hf_token_here"
 API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
 headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
 
@@ -88,32 +88,41 @@ def calculate_scene_similarity(current_low_res):
     global prev_low_res_hist
     hist = cv2.calcHist([current_low_res], [0], None, [64], [0, 256])
     cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
-
     if prev_low_res_hist is None:
         prev_low_res_hist = hist
         return 0.0
-
     similarity = cv2.compareHist(prev_low_res_hist, hist, cv2.HISTCMP_CORREL)
     prev_low_res_hist = hist
     return similarity
 
 
 # -------------------------------------------------------------------------
-# REAL-TIME ADAPTIVE PIPELINE CONTROLLER WITH BILATERAL SMOOTHING
+# UNIVERSAL PIPELINE CONTROLLER ENGINE (STATIC + STREAMING)
 # -------------------------------------------------------------------------
-def process_live_webcam_stream(frame, texture_dropdown):
+def process_universal_pipeline(frame, texture_dropdown):
     global cached_texture_pattern, cached_final_composited, cached_simulated_frame, cached_confusion_mask, accumulated_mask, last_api_call_time
 
-    if frame is None:
-        return None, None, None, None, "Offline Telemetry"
+    # 1. التحقق الآمن من جودة ومصدر الإطار (Safe Fallback Validation)
+    if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+        try:
+            # محاولة قراءة صورة الفلتر الافتراضية test.jpg الموجودة في المشروع المكتبي
+            frame = cv2.imread("test.jpg")
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            status_text = "🟢 Mode: Default Static Test Image Active"
+        except:
+            # بناء بيئة اختبار هندسية ديناميكية لمنع شاشات الانهيار البيضاء
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.circle(frame, (320, 240), 120, (200, 50, 50), -1)
+            cv2.rectangle(frame, (200, 350), (440, 400), (50, 180, 50), -1)
+            status_text = "⚠️ Mode: Internal Geometry Matrix Fallback Active (test.jpg missing)"
+    else:
+        status_text = "⚡ Mode: Live Active Webcam Stream Engaged"
+        # تصحيح تدرج الألوان المتدفق حياً
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     h, w, _ = frame.shape
-
-    # 1. تصغير الأبعاد السريع
     low_res = cv2.resize(frame, (320, 240))
 
-    # 2. التحليل الإحصائي والتكيف الذاتي
     gray_low_res = cv2.cvtColor(low_res, cv2.COLOR_RGB2GRAY)
     mean_brightness, std_variance = cv2.meanStdDev(gray_low_res)
     mean_brightness = float(mean_brightness[0][0])
@@ -123,17 +132,12 @@ def process_live_webcam_stream(frame, texture_dropdown):
     adaptive_alpha = float(np.clip(0.20 + (std_variance * 0.008), 0.30, 0.75))
     adaptive_scene_limit = float(np.clip(0.97 + (mean_brightness * 0.0001), 0.96, 0.99))
 
-    # 3. فحص حركة المشهد
     scene_similarity = calculate_scene_similarity(low_res)
     scene_has_changed = scene_similarity < adaptive_scene_limit
 
     if not scene_has_changed and cached_final_composited is not None:
-        status_text = "🟢 STATIC BOUNDARIES | Spatial Bilateral Smoothing Cached"
-        return frame, cached_simulated_frame, cached_confusion_mask, cached_final_composited, status_text
+        return frame, cached_simulated_frame, cached_confusion_mask, cached_final_composited, f"🟢 Cached State | {status_text}"
 
-    status_text = "⚡ ADAPTIVE PROCESSING | Applying Edge-Preserving Bilateral Filter..."
-
-    # 4. محاكاة واستخراج قناع الالتباس اللحظي
     low_res_sim = simulate_deuteranopia(low_res)
     orig_lab = cv2.cvtColor(low_res, cv2.COLOR_RGB2LAB)
     sim_lab = cv2.cvtColor(low_res_sim.astype(np.uint8), cv2.COLOR_RGB2LAB)
@@ -147,7 +151,6 @@ def process_live_webcam_stream(frame, texture_dropdown):
         if stats[i, cv2.CC_STAT_AREA] > 150:
             filtered_low_res_mask[labels_im == i] = 255
 
-    # 5. التثبيت الزمني للمصفوفة
     if accumulated_mask is None or accumulated_mask.shape != filtered_low_res_mask.shape:
         accumulated_mask = filtered_low_res_mask.astype(np.float32)
     else:
@@ -155,11 +158,10 @@ def process_live_webcam_stream(frame, texture_dropdown):
 
     stabilized_low_res_mask = cv2.threshold(accumulated_mask.astype(np.uint8), 127, 255, cv2.THRESH_BINARY)[1]
 
-    # 6. الميزة الجديدة (Edge-Preserving Spatial Smoothing):
-    # تطبيق الفلتر الثنائي لضمان عدم خروج النقوش عن حواف الجسم الخلفية وحمايتها من التشويه
-    smoothed_low_res_mask = cv2.bilateralFilter(stabilized_low_res_mask, d=5, sigmaColor=75, sigmaSpace=75)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    smoothed_low_res_mask = cv2.morphologyEx(stabilized_low_res_mask, cv2.MORPH_CLOSE, kernel)
+    smoothed_low_res_mask = cv2.bilateralFilter(smoothed_low_res_mask, d=5, sigmaColor=75, sigmaSpace=75)
 
-    # 7. تحديث طلبات الذكاء الاصطناعي بشكل خلفي غير متزامن
     current_time = time.time()
     if (current_time - last_api_call_time > 3.0) and not api_lock.locked():
         last_api_call_time = current_time
@@ -169,7 +171,6 @@ def process_live_webcam_stream(frame, texture_dropdown):
             daemon=True
         ).start()
 
-    # 8. التكبير النهائي والدمج الشفاف المستقر والمنعم حوافه
     final_mask = cv2.resize(smoothed_low_res_mask, (w, h), interpolation=cv2.INTER_NEAREST)
     cached_confusion_mask = cv2.cvtColor(final_mask, cv2.COLOR_GRAY2RGB)
     cached_simulated_frame = cv2.resize(low_res_sim, (w, h)).astype(np.uint8)
@@ -179,6 +180,10 @@ def process_live_webcam_stream(frame, texture_dropdown):
     else:
         local_texture = frame
 
+    region_mean_intensity = cv2.mean(gray_low_res, mask=smoothed_low_res_mask)[0]
+    if region_mean_intensity < 127:
+        local_texture = cv2.bitwise_not(local_texture)
+
     cached_final_composited = apply_alpha_blending(
         original_rgb=frame,
         ai_textured_rgb=local_texture,
@@ -186,41 +191,69 @@ def process_live_webcam_stream(frame, texture_dropdown):
         alpha=adaptive_alpha
     )
 
-    return frame, cached_simulated_frame, cached_confusion_mask, cached_final_composited, status_text
+    full_status_report = (
+        f"{status_text}\n"
+        f"📊 Environment Profiles: Brightness={mean_brightness:.1f} | Variance={std_variance:.1f}\n"
+        f"⚙️ Active Configurations: Mask Threshold={adaptive_threshold} | Blending Alpha={adaptive_alpha:.2f}"
+    )
+
+    return frame, cached_simulated_frame, cached_confusion_mask, cached_final_composited, full_status_report
 
 
 # -------------------------------------------------------------------------
-# MODULE 1: UI Layout Dashboard
+# MODULE 1: UI Layout Dashboard (واجهة معززة هجينة تلقائية)
 # -------------------------------------------------------------------------
-with gr.Blocks(title="ChromaSight AI - Smooth Boundaries") as demo:
+# نقوم بإنشاء المخرجات أولاً ليتمكن المحرك الافتراضي من تعبئتها فور التشغيل الأول
+out_orig = gr.Image(label="1. Original Target Frame", interactive=False)
+out_sim = gr.Image(label="2. Perceptual CVD Simulation", interactive=False)
+out_mask = gr.Image(label="3. Morphologically Closed Mask", interactive=False)
+out_final = gr.Image(label="4. Safe-Composited Accessibility Output", interactive=False)
+scene_telemetry = gr.Textbox(label="System Architecture Metrics", interactive=False, lines=4)
+
+with gr.Blocks(title="ChromaSight AI - Universal Dashboard") as demo:
     gr.Markdown(
         """
-        # 👁️ ChromaSight AI — Edge-Preserving Bilateral Smoothing Framework
-        ### Advanced Spatial Filtering to Eliminate Texture Bleeding and Optimize Structural Contrast
+        # 👁️ ChromaSight AI — Universal Hybrid Stream Dashboard
+        ### Auto-Init Static Test Frame Pipeline with Seamless Hot-Swappable Live Webcam Execution
         """
     )
 
     with gr.Row():
         with gr.Column(scale=1):
-            gr.Markdown("### 🛠️ System Interface")
-            webcam_input = gr.Image(sources=["webcam"], type="numpy", streaming=True, label="Active Video Buffer")
+            gr.Markdown("### 🛠️ System Control Interface")
+
+            # تم تمكين الكاميرا مع السماح لـ Gradio بالتحميل الذاتي الافتراضي
+            webcam_input = gr.Image(
+                sources=["webcam"],
+                type="numpy",
+                streaming=True,
+                label="Active Camera Buffer Input"
+            )
             texture_dropdown = gr.Dropdown(choices=["dots", "hatching", "voronoi"], value="dots",
                                            label="AI Texture Pattern Style")
 
-            gr.Markdown("### 📡 Telemetry Monitor")
-            scene_telemetry = gr.Textbox(label="Spatial Filter Metrics", interactive=False, lines=4)
+            gr.Markdown("### 📡 System Telemetry Monitor")
+            scene_telemetry.render()
 
         with gr.Column(scale=3):
-            gr.Markdown("### 📊 Stabilized Live Displays")
+            gr.Markdown("### 📊 Synchronized Vision Pipelines")
             with gr.Row():
-                out_orig = gr.Image(label="1. Original Live Stream", interactive=False)
-                out_sim = gr.Image(label="2. Perceptual CVD Simulation", interactive=False)
+                out_orig.render()
+                out_sim.render()
             with gr.Row():
-                out_mask = gr.Image(label="3. Bilateral Smoothed Mask", interactive=False)
-                out_final = gr.Image(label="4. Edge-Locked Composited Output", interactive=False)
+                out_mask.render()
+                out_final.render()
 
+    # الإجراء الأول (Auto-Initialization on Load): يتم تفعيل الأنابيب الأربعة تلقائياً بصورة ديفولت فور فتح الصفحة
+    demo.load(
+        fn=process_universal_pipeline,
+        inputs=[gr.State(None), texture_dropdown],
+        outputs=[out_orig, out_sim, out_mask, out_final, scene_telemetry]
+    )
+
+    # الإجراء الثاني (Live Streaming Switch): عندما يقرر المستخدم النقر على الكاميرا، يبدأ البث المباشر فوراً وتتحدث الواجهة
     webcam_input.stream(
-        fn=process_live_webcam_stream,
+        fn=process_universal_pipeline,
         inputs=[webcam_input, texture_dropdown],
         outputs=[out_orig, out_sim, out_mask, out_final, scene_telemetry],
         queue=True,
