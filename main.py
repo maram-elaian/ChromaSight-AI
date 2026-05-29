@@ -62,10 +62,6 @@ def boost_color_contrast_lab(frame, mask, chroma_boost=1.35, luma_boost=1.08):
     else:
         mask_bool = mask > 0
 
-    # OpenCV LAB ranges:
-    # L = 0..255
-    # A/B = 0..255 with center at 128
-
     l[mask_bool] = np.clip(l[mask_bool] * luma_boost, 0, 255)
 
     a_shifted = a[mask_bool] - 128.0
@@ -119,65 +115,43 @@ def generate_local_clean_texture(style, h, w, scale_factor, angle_deg, is_live):
                                          borderMode=cv2.BORDER_REFLECT_101)
     return transformed_texture
 
-def apply_adaptive_clahe(frame):
 
+def apply_adaptive_clahe(frame):
     if frame.dtype != np.uint8:
         frame = frame.astype(np.uint8)
 
     lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB)
-
     l, a, b = cv2.split(lab)
-
     brightness_std = np.std(l)
 
-    adaptive_clip = float(np.clip(
-        2.0 + (brightness_std / 45.0),
-        2.0,
-        5.0
-    ))
-
+    adaptive_clip = float(np.clip(2.0 + (brightness_std / 45.0), 2.0, 5.0))
     h, w = l.shape
-
     tile_size = max(8, int(min(h, w) / 32))
 
-    clahe = cv2.createCLAHE(
-        clipLimit=adaptive_clip,
-        tileGridSize=(tile_size, tile_size)
-    )
-
+    clahe = cv2.createCLAHE(clipLimit=adaptive_clip, tileGridSize=(tile_size, tile_size))
     enhanced_l = clahe.apply(l)
 
     merged = cv2.merge([enhanced_l, a, b])
+    return cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)
 
-    normalized = cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)
 
-    return normalized
 # -------------------------------------------------------------------------
-# UNIVERSAL PIPELINE CONTROLLER - ABSOLUTE LIVE ACCESSIBILITY FIX
+# UNIVERSAL PIPELINE CONTROLLER
 # -------------------------------------------------------------------------
 def hysteresis_threshold(diff, frame_gray, prev_mask=None):
-    """
-    Dual-threshold adaptive hysteresis based on ambient brightness.
-    """
+    diff_mean = float(np.mean(diff))
+    diff_std = float(np.std(diff))
 
-    B = float(np.mean(frame_gray))
-    sigma = float(np.std(frame_gray))
-
-    # Dynamic thresholds (core idea from your prompt)
-    T_high = np.clip(0.8 * B + 0.6 * sigma, 20, 180)
-    T_low  = np.clip(0.4 * B - 0.3 * sigma, 5, 120)
+    T_high = np.clip(diff_mean + (1.8 * diff_std), 15, 90)
+    T_low = np.clip(diff_mean + (0.7 * diff_std), 8, 50)
 
     strong = (diff > T_high).astype(np.uint8)
     weak = (diff > T_low).astype(np.uint8)
 
-    # Hysteresis propagation
     if prev_mask is None:
         prev_mask = np.zeros_like(diff, dtype=np.uint8)
 
-    # Keep strong edges
     result = strong.copy()
-
-    # Keep weak pixels only if connected to strong
     num_labels, labels = cv2.connectedComponents(weak)
 
     for i in range(1, num_labels):
@@ -185,21 +159,32 @@ def hysteresis_threshold(diff, frame_gray, prev_mask=None):
         if np.any(strong[region]):
             result[region] = 1
 
-    # Temporal stability (very important for live stream)
-    result = cv2.addWeighted(result.astype(np.float32),
-                             0.7,
-                             prev_mask.astype(np.float32),
-                             0.3,
-                             0)
+    result = cv2.addWeighted(result.astype(np.float32), 0.7, prev_mask.astype(np.float32), 0.3, 0)
+    return (result > 0.5).astype(np.uint8) * 255
 
-    result = (result > 0.5).astype(np.uint8) * 255
 
-    return result
+prev_gray_frame = None
+prev_warped_mask = None
+
+
+def warp_mask_with_flow(mask, flow):
+    h, w = mask.shape
+    flow_x = flow[..., 0]
+    flow_y = flow[..., 1]
+    grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+
+    map_x = (grid_x - flow_x).astype(np.float32)
+    map_y = (grid_y - flow_y).astype(np.float32)
+
+    return cv2.remap(mask.astype(np.float32), map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REFLECT)
+
+
 def process_universal_pipeline(frame, texture_dropdown):
     global cached_texture_pattern, cached_final_composited, cached_simulated_frame, cached_confusion_mask, accumulated_mask, system_mode_tracker
-    global prev_low_res_hist
-    global ema_low_res_mask
+    global prev_low_res_hist, ema_low_res_mask, prev_gray_frame, prev_warped_mask
 
+    # التعديل رقم 3: إصلاح سبب الثبات على صورة افتراضية
     if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
         is_live_stream = False
         system_mode_tracker = "STATIC"
@@ -223,87 +208,74 @@ def process_universal_pipeline(frame, texture_dropdown):
         is_live_stream = True
         frame = frame.copy()
 
+        # التعديل رقم 4: تفريغ الذاكرة الزمنية عند الانتقال للبث المباشر لمنع التجميد
         if system_mode_tracker == "STATIC":
             accumulated_mask = None
+            prev_gray_frame = None
+            prev_warped_mask = None
+            ema_low_res_mask = None
             system_mode_tracker = "LIVE"
 
     h, w, _ = frame.shape
-
     low_res_w, low_res_h = 320, 240
     low_res = cv2.resize(frame, (low_res_w, low_res_h))
-    # -----------------------------------------------------------------
-    # AUTOMATED LIGHTING NORMALIZATION PREPROCESSOR
-    # -----------------------------------------------------------------
+
     low_res = apply_adaptive_clahe(low_res)
     gray_low_res = cv2.cvtColor(low_res, cv2.COLOR_RGB2GRAY)
+
+    if prev_gray_frame is None:
+        flow = None
+    else:
+        flow = cv2.calcOpticalFlowFarneback(prev_gray_frame, gray_low_res, None, 0.5, 2, 9, 3, 5, 1.2, 0)
+
     mean_brightness, std_variance = cv2.meanStdDev(gray_low_res)
     mean_brightness = float(mean_brightness[0][0])
     std_variance = float(std_variance[0][0])
 
-    # --- 🛠️ تعديل الحساسية الذكية للفيديو الحي لمنع الشاشة السوداء ---
     if is_live_stream:
-        # خفض العتبة البرمجية لزيادة حساسية التقاط الفروق اللونية الضعيفة في الغرفة العادية
-        adaptive_threshold = int(np.clip(14 - (mean_brightness * 0.02), 5, 20))
         adaptive_alpha = float(np.clip(0.55 + (std_variance * 0.004), 0.60, 0.85))
     else:
-        adaptive_threshold = int(np.clip(26 - (mean_brightness * 0.05), 8, 32))
         adaptive_alpha = float(np.clip(0.40 + (std_variance * 0.003), 0.45, 0.70))
 
-    # محاكاة وحساب قناع الالتباس
     low_res_sim = simulate_deuteranopia(low_res)
-
-    # -------------------------------------------------------------------------
-    # ADVANCED PREPROCESSING MODULE:
-    # Adaptive CLAHE Illumination Normalization
-    # -------------------------------------------------------------------------
-
     orig_lab = cv2.cvtColor(low_res, cv2.COLOR_RGB2LAB)
     sim_lab = cv2.cvtColor(low_res_sim.astype(np.uint8), cv2.COLOR_RGB2LAB)
 
-    # حساب الفروق التباينية في القنوات اللونية بدقة مضاعفة للـ Live Cam
     diff_a = cv2.absdiff(orig_lab[:, :, 1], sim_lab[:, :, 1])
     diff_b = cv2.absdiff(orig_lab[:, :, 2], sim_lab[:, :, 2])
-    diff = cv2.addWeighted(diff_a, 1.0, diff_b, 1.0, 0)
 
+    if prev_gray_frame is None:
+        motion_weight = np.ones_like(diff_a, dtype=np.float32)
+    else:
+        magnitude = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+        magnitude = cv2.resize(magnitude, (diff_a.shape[1], diff_a.shape[0]))
+        motion_weight = cv2.normalize(magnitude, None, 0.7, 1.6, cv2.NORM_MINMAX)
 
-    # Gaussian smoothing لتحسين الاستقرار
+    motion_weight = motion_weight.astype(np.float32)
+    diff = (diff_a.astype(np.float32) + diff_b.astype(np.float32)) * 0.5
+    diff = np.clip(diff * motion_weight, 0, 255).astype(np.uint8)
     diff = cv2.GaussianBlur(diff, (5, 5), 0)
 
-    # Hysteresis mask
-    # Hysteresis (optional weak stabilization)
     raw_mask = hysteresis_threshold(diff, gray_low_res, None)
-
-    # EMA memory (primary stabilization)
     current_mask = raw_mask.astype(np.float32)
 
     if ema_low_res_mask is None or ema_low_res_mask.shape != current_mask.shape:
         ema_low_res_mask = current_mask.copy()
     else:
         alpha = np.clip(0.25 + (std_variance * 0.002), 0.2, 0.5)
-
         ema_low_res_mask = alpha * current_mask + (1 - alpha) * ema_low_res_mask
 
-    low_res_mask = (ema_low_res_mask > 127).astype(np.uint8) * 255
-    # Convert to float for stable temporal filtering
-    current_mask = low_res_mask.astype(np.float32)
+    # التعديل رقم 1: عتبة الـ EMA الديناميكية المعايرة
+    low_res_mask = (ema_low_res_mask > 0.5 * 255).astype(np.uint8) * 255
 
-    if ema_low_res_mask is None or ema_low_res_mask.shape != current_mask.shape:
-        ema_low_res_mask = current_mask.copy()
-    else:
-        alpha = np.clip(0.25 + (std_variance * 0.002), 0.2, 0.5) # responsiveness control
+    if flow is not None and prev_warped_mask is not None:
+        warped_prev = warp_mask_with_flow(prev_warped_mask, flow)
+        low_res_mask = cv2.addWeighted(low_res_mask.astype(np.float32), 0.6, np.clip(warped_prev, 0, 255), 0.4,
+                                       0).astype(np.uint8)
 
-        ema_low_res_mask = (
-                alpha * current_mask +
-                (1 - alpha) * ema_low_res_mask
-        )
+    prev_warped_mask = low_res_mask.copy()
+    prev_gray_frame = gray_low_res.copy()
 
-    # Re-binarize for downstream pipeline
-    low_res_mask = (ema_low_res_mask > 127).astype(np.uint8) * 255
-
-    # تحديث الذاكرة الزمنية
-    prev_low_res_hist = low_res_mask.copy()
-
-    # تنظيف الضوضاء وفلترة الأشكال العشوائية الصغيرة
     num_labels, labels_im, stats, _ = cv2.connectedComponentsWithStats(low_res_mask)
     filtered_low_res_mask = np.zeros_like(low_res_mask)
     min_area_filter = 30 if is_live_stream else 60
@@ -315,46 +287,22 @@ def process_universal_pipeline(frame, texture_dropdown):
         if accumulated_mask is None or accumulated_mask.shape != filtered_low_res_mask.shape:
             accumulated_mask = filtered_low_res_mask.astype(np.float32)
         else:
-            # معامِل تراكم مرن وسريع الاستجابة لحركة ألوان الغرفة الحية
-            cv2.accumulateWeighted(
-                filtered_low_res_mask.astype(np.float32),
-                accumulated_mask,
-                0.25
-            )
+            cv2.accumulateWeighted(filtered_low_res_mask.astype(np.float32), accumulated_mask, 0.25)
     else:
         accumulated_mask = filtered_low_res_mask.astype(np.float32)
 
     acc_uint8 = cv2.normalize(accumulated_mask, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    _, stabilized_low_res_mask = cv2.threshold(
-        acc_uint8,
-        35,
-        255,
-        cv2.THRESH_BINARY
-    )
-
+    _, stabilized_low_res_mask = cv2.threshold(acc_uint8, 35, 255, cv2.THRESH_BINARY)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3) if is_live_stream else (5, 5))
     smoothed_low_res_mask = cv2.morphologyEx(stabilized_low_res_mask, cv2.MORPH_CLOSE, kernel)
 
-    # --- 🎯 إصلاح حركة الدائرة البؤرية التفاعلية المستقلة ---
     foveated_mask = np.zeros_like(smoothed_low_res_mask)
     center_x_low = int(low_res_w / 2)
-    # جعل الدائرة تتحرك جيبياً بشكل مبهج يحاكي مسح بؤرة العين للمشهد لتوضيح الفكرة للدكتور
     center_y_low = int(low_res_h / 2 + (np.sin(time.time() * 2.5) * 35 if is_live_stream else 0))
     focus_radius_low = int(min(low_res_w, low_res_h) * 0.45)
-
     cv2.circle(foveated_mask, (center_x_low, center_y_low), focus_radius_low, 255, -1)
+    smoothed_low_res_mask = cv2.addWeighted(smoothed_low_res_mask, 0.8, foveated_mask, 0.2, 0)
 
-    # دمج قناع الألوان المكتشف تفاعلياً مع بؤرة نظارة الواقع المعزز المركزية
-    smoothed_low_res_mask = cv2.addWeighted(
-        smoothed_low_res_mask,
-        0.8,
-        foveated_mask,
-        0.2,
-        0
-    )
-
-    # تكبير هندسي متطابق لمصفوفة العرض الحالية
     final_mask = cv2.resize(smoothed_low_res_mask, (w, h), interpolation=cv2.INTER_NEAREST)
     cached_confusion_mask = cv2.cvtColor(final_mask, cv2.COLOR_GRAY2RGB)
 
@@ -372,36 +320,31 @@ def process_universal_pipeline(frame, texture_dropdown):
     current_angle = float(np.degrees(np.arctan2(mean_dy, mean_dx)))
 
     local_texture = generate_local_clean_texture(texture_dropdown, h, w, current_scale, current_angle, is_live_stream)
-
-    region_mean_intensity = cv2.mean(gray_full, mask=final_mask)[0]
-    if region_mean_intensity < 110:
+    if cv2.mean(gray_full, mask=final_mask)[0] < 110:
         local_texture = cv2.bitwise_not(local_texture)
 
-    # دمج الأنماط الهندسية بدقة داخل المناطق الملونة الملتبسة المكتشفة حياً
-    cached_final_composited = apply_alpha_blending(
-        original_rgb=boosted_frame,
-        ai_textured_rgb=local_texture,
-        binary_mask_rgb=cached_confusion_mask,
-        alpha=adaptive_alpha
-    )
+    cached_final_composited = apply_alpha_blending(boosted_frame, local_texture, cached_confusion_mask, adaptive_alpha)
 
-    # رسم طوق بؤرة العين الأخضر الملاحق للحركة التفاعلية اللحظية بدقة متناهية
     real_center_x = int(w / 2)
     real_center_y = int(h / 2 + (np.sin(time.time() * 2.5) * (h / 240 * 35) if is_live_stream else 0))
     real_focus_radius = int(min(w, h) * 0.45)
     cv2.circle(cached_final_composited, (real_center_x, real_center_y), real_focus_radius, (0, 255, 0), 2,
                lineType=cv2.LINE_AA)
 
-    # تقرير الأداء المحدث لتقديمه للجنة
     full_status_report = (
         f"{status_text}\n"
-        f"🎯 Matrix Output Block: Dynamic Grid Allocation = {w}x{h} [100% Responsive Sync]\n"
-        f"🌊 Confusion Threshold Matrix: Boosted Enabled | Active Detection Layer Sensitivity Restructured\n"
-        f"📐 Spatial HUD Tracking: Dynamic Fovea Movement Enabled | Overlay Scale = {current_scale:.2f}x\n"
-        f"⚙️ Sensory Feed: Ambient Lighting Coefficient = {mean_brightness:.1f} | Chroma Contrast Stability = Active"
+        f"🎯 Matrix Output Block: Dynamic Grid Allocation = {w}x{h}\n"
+        f"🌊 Confusion Threshold Matrix: Boosted Enabled\n"
+        f"📐 Spatial HUD Tracking: Dynamic Fovea Movement Enabled | Scale = {current_scale:.2f}x\n"
+        f"⚙️ Sensory Feed: Ambient Lighting Coefficient = {mean_brightness:.1f}"
     )
 
     return frame, cached_simulated_frame, cached_confusion_mask, cached_final_composited, full_status_report
+
+
+# دالة مخصصة لتهيئة وعرض الصورة الافتراضية بمجرد تشغيل السكربت
+def load_initial_preview(texture_dropdown):
+    return process_universal_pipeline(None, texture_dropdown)
 
 
 # -------------------------------------------------------------------------
@@ -441,18 +384,19 @@ with gr.Blocks(title="ChromaSight AI - Absolute Solution") as demo:
                 out_mask.render()
                 out_final.render()
 
+    # الإصلاح الجوهري: استدعاء الدالة عند تحميل الصفحة مباشرة لعرض الصور الافتراضية فوراً
     demo.load(
-        fn=process_universal_pipeline,
-        inputs=[gr.State(None), texture_dropdown],
+        fn=load_initial_preview,
+        inputs=[texture_dropdown],
         outputs=[out_orig, out_sim, out_mask, out_final, scene_telemetry]
     )
 
+    # التعديل رقم 2: معالجة بث الكاميرا الحي بشكل مستمر ومستقر بدون تجميد
     webcam_input.stream(
         fn=process_universal_pipeline,
         inputs=[webcam_input, texture_dropdown],
         outputs=[out_orig, out_sim, out_mask, out_final, scene_telemetry],
-        queue=True,
-        time_limit=30
+        queue=True
     )
 
 if __name__ == "__main__":
